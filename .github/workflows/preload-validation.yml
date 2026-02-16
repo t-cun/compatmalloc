@@ -1,0 +1,78 @@
+name: LD_PRELOAD Validation
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly on Sunday at 04:00 UTC
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preload-validation:
+    name: LD_PRELOAD integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release library
+        run: cargo build --release
+      - name: Verify library exists
+        run: test -f target/release/libcompatmalloc.so
+
+      - name: Test with bash
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            bash -c 'echo hello; ls -la /tmp'
+
+      - name: Test with python3
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            python3 -c 'import json; print(json.dumps({"test": True}))'
+
+      - name: Test with git
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            git log --oneline -5
+
+      - name: Test with ls
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            ls -la /
+
+      - name: Test with cat
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            cat /etc/hostname
+
+      - name: Test with grep
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            grep -c '' /etc/passwd
+
+      - name: Test with find
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            find /tmp -maxdepth 1 -type f 2>/dev/null || true
+
+      - name: Test with curl (if available)
+        run: |
+          if command -v curl &>/dev/null; then
+            LD_PRELOAD=./target/release/libcompatmalloc.so \
+              curl -s -o /dev/null -w '%{http_code}' https://httpbin.org/get || true
+          fi
+
+      - name: Test disabled mode (COMPATMALLOC_DISABLE)
+        run: |
+          COMPATMALLOC_DISABLE=1 LD_PRELOAD=./target/release/libcompatmalloc.so \
+            bash -c 'echo "Disabled mode works"; ls /tmp > /dev/null'
+
+      - name: Run full integration test script
+        run: |
+          chmod +x tests/integration/test_preload.sh
+          tests/integration/test_preload.sh

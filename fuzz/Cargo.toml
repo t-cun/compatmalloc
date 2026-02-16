@@ -1,0 +1,26 @@
+[package]
+name = "compatmalloc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.compatmalloc]
+path = "../crates/compatmalloc"
+
+[[bin]]
+name = "fuzz_ops"
+path = "fuzz_targets/fuzz_ops.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sizes"
+path = "fuzz_targets/fuzz_sizes.rs"
+doc = false
+
+[workspace]

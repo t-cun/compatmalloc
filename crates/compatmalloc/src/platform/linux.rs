@@ -1,0 +1,76 @@
+use core::ptr;
+
+/// Map anonymous read-write memory.
+///
+/// # Safety
+/// `size` must be page-aligned and non-zero.
+pub unsafe fn map_anonymous(size: usize) -> *mut u8 {
+    let result = libc::mmap(
+        ptr::null_mut(),
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if result == libc::MAP_FAILED {
+        ptr::null_mut()
+    } else {
+        result as *mut u8
+    }
+}
+
+/// Unmap memory.
+///
+/// # Safety
+/// `ptr` must have been returned by `map_anonymous` with the same `size`.
+pub unsafe fn unmap(ptr: *mut u8, size: usize) {
+    libc::munmap(ptr as *mut libc::c_void, size);
+}
+
+/// Mark memory as inaccessible (guard page).
+///
+/// # Safety
+/// Region must be valid and page-aligned.
+pub unsafe fn protect_none(ptr: *mut u8, size: usize) {
+    libc::mprotect(ptr as *mut libc::c_void, size, libc::PROT_NONE);
+}
+
+/// Mark memory as read-write.
+///
+/// # Safety
+/// Region must be valid and page-aligned.
+pub unsafe fn protect_read_write(ptr: *mut u8, size: usize) {
+    libc::mprotect(
+        ptr as *mut libc::c_void,
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+    );
+}
+
+/// Advise kernel that pages can be reclaimed.
+///
+/// # Safety
+/// Region must be valid and page-aligned.
+pub unsafe fn advise_free(ptr: *mut u8, size: usize) {
+    libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_DONTNEED);
+}
+
+/// Get the number of online CPUs.
+pub fn num_cpus() -> usize {
+    unsafe {
+        let n = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+        if n < 1 {
+            1
+        } else {
+            n as usize
+        }
+    }
+}
+
+/// Get a cheap thread identifier for arena affinity.
+/// Uses the thread ID from the kernel.
+#[inline]
+pub fn thread_id() -> usize {
+    unsafe { libc::syscall(libc::SYS_gettid) as usize }
+}

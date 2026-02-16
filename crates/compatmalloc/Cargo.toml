@@ -1,0 +1,34 @@
+[package]
+name = "compatmalloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A memory-hardening drop-in allocator with standard C ABI"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["hardened"]
+hardened = [
+    "quarantine",
+    "guard-pages",
+    "slot-randomization",
+    "canaries",
+    "poison-on-free",
+    "write-after-free-check",
+    "zero-on-free",
+]
+quarantine = []
+guard-pages = []
+slot-randomization = []
+canaries = []
+poison-on-free = []
+write-after-free-check = []
+zero-on-free = []
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rand = "0.8"

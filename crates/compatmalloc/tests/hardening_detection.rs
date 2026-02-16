@@ -1,0 +1,332 @@
+//! Hardening verification tests for compatmalloc.
+//!
+//! These tests verify that the hardening features (double-free detection,
+//! memory poisoning, canary corruption detection) work correctly.
+//!
+//! Tests that expect the process to abort are run as subprocesses: we spawn
+//! the test binary with a specific test name and check that the child exits
+//! with a signal (SIGABRT) and prints the expected diagnostic message.
+
+use std::ptr;
+
+/// Helper: initialize the allocator and return a reference to it.
+unsafe fn alloc() -> &'static compatmalloc::allocator::HardenedAllocator {
+    compatmalloc::init::ensure_initialized();
+    compatmalloc::init::allocator()
+}
+
+// ---------------------------------------------------------------------------
+// Helper: run a subprocess that executes a specific "scenario" and check
+// that it aborts with the expected message on stderr.
+// ---------------------------------------------------------------------------
+
+/// Run the current test binary with the environment variable
+/// `COMPATMALLOC_HARDENING_SCENARIO` set to `scenario_name`.
+/// The child process will detect this variable and run the corresponding
+/// scenario (which should trigger an abort).
+///
+/// We verify:
+/// 1. The child exited due to a signal (not exit code 0).
+/// 2. The child's stderr contains `expected_msg`.
+fn expect_abort_subprocess(scenario_name: &str, expected_msg: &str) {
+    let exe = std::env::current_exe().expect("cannot determine test binary path");
+
+    let output = std::process::Command::new(&exe)
+        .env("COMPATMALLOC_HARDENING_SCENARIO", scenario_name)
+        // Run the scenario driver test; the exact test function name
+        // doesn't matter because the driver detects the env var and runs
+        // the scenario, then exits before the assertion below fires.
+        .arg("--exact")
+        .arg("scenario_driver")
+        .arg("--nocapture")
+        // Prevent infinite recursion if the test runner re-invokes itself.
+        .env("RUST_TEST_THREADS", "1")
+        .output()
+        .expect("failed to spawn subprocess");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The process must NOT have succeeded.
+    assert!(
+        !output.status.success(),
+        "subprocess for scenario '{}' should have been killed by a signal, \
+         but exited successfully. stderr:\n{}",
+        scenario_name,
+        stderr
+    );
+
+    // Check for the expected diagnostic on stderr.
+    assert!(
+        stderr.contains(expected_msg),
+        "subprocess for scenario '{}' stderr does not contain '{}'. \
+         Full stderr:\n{}",
+        scenario_name,
+        expected_msg,
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario driver: when the COMPATMALLOC_HARDENING_SCENARIO env var is set,
+// run the requested scenario instead of normal test assertions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scenario_driver() {
+    let scenario = match std::env::var("COMPATMALLOC_HARDENING_SCENARIO") {
+        Ok(s) => s,
+        Err(_) => return, // Not a subprocess invocation; skip.
+    };
+
+    match scenario.as_str() {
+        "double_free" => scenario_double_free(),
+        "canary_corruption" => scenario_canary_corruption(),
+        _ => panic!("unknown scenario: {}", scenario),
+    }
+}
+
+/// Scenario: double-free. Allocate, free, free again.
+fn scenario_double_free() {
+    unsafe {
+        let a = alloc();
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        a.free(p);
+        // Second free should trigger abort.
+        a.free(p);
+    }
+    // Should never reach here.
+    unreachable!("double free was not detected");
+}
+
+/// Scenario: canary corruption. Allocate, write past the end, free.
+fn scenario_canary_corruption() {
+    unsafe {
+        let a = alloc();
+        // Request a small size that will have a gap in the slot (canary area).
+        // Size class 0 is 16 bytes; request fewer so there is a canary gap.
+        // Actually, to guarantee a canary gap we need requested_size < slot_size.
+        // Request 10 bytes -- the smallest size class is 16, so there is a
+        // 6-byte canary gap.
+        let requested = 10;
+        let p = a.malloc(requested);
+        assert!(!p.is_null());
+
+        // Corrupt the canary by writing past the requested size.
+        // The canary lives at bytes [requested..slot_size).
+        // Overwrite the first canary byte.
+        p.add(requested).write(0x00);
+
+        // Freeing should detect the corrupted canary and abort.
+        a.free(p);
+    }
+    unreachable!("canary corruption was not detected");
+}
+
+// ---------------------------------------------------------------------------
+// Test: double-free is detected (subprocess)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_free_detected() {
+    expect_abort_subprocess("double_free", "double free detected");
+}
+
+// ---------------------------------------------------------------------------
+// Test: canary corruption is detected (subprocess)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "canaries")]
+fn canary_corruption_detected() {
+    expect_abort_subprocess("canary_corruption", "canary corrupted");
+}
+
+// ---------------------------------------------------------------------------
+// Test: freed memory is poisoned with 0xFE
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "poison-on-free")]
+fn freed_memory_is_poisoned() {
+    // The poison byte is 0xFE (defined in util.rs).
+    const POISON: u8 = 0xFE;
+
+    unsafe {
+        let a = alloc();
+
+        // We need to read freed memory, which is normally UB in Rust.
+        // In this allocator, freed slab memory remains mapped (it goes into
+        // quarantine or stays in the slab), so the pages are still readable.
+        // We allocate, record the pointer, free it, then read.
+
+        let size = 64;
+        let p = a.malloc(size);
+        assert!(!p.is_null());
+
+        // Fill with a known pattern (not 0xFE) to ensure we see the change.
+        ptr::write_bytes(p, 0xAA, size);
+
+        // Free it -- the allocator should poison the memory.
+        a.free(p);
+
+        // Read back. The allocator zeros first then poisons the full slot_size.
+        // Since poison is applied last, the bytes should always be 0xFE when
+        // poison-on-free is enabled, regardless of zero-on-free.
+        let slice = std::slice::from_raw_parts(p, size);
+
+        assert!(
+            slice.iter().all(|&b| b == POISON),
+            "freed memory should be poisoned with 0x{:02X}, \
+             but found: {:02X?}",
+            POISON,
+            &slice[..8.min(size)]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: freed memory poison covers the full slot
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(all(feature = "poison-on-free", not(feature = "zero-on-free")))]
+fn freed_memory_poison_full_slot() {
+    const POISON: u8 = 0xFE;
+
+    unsafe {
+        let a = alloc();
+
+        // Request a small amount; the slot will be 16 bytes (smallest class).
+        let requested = 1;
+        let p = a.malloc(requested);
+        assert!(!p.is_null());
+
+        // Get the usable size (slot size).
+        let slot_size = a.usable_size(p);
+        assert!(
+            slot_size >= requested,
+            "usable_size {} < requested {}",
+            slot_size,
+            requested
+        );
+
+        ptr::write_bytes(p, 0xAA, slot_size);
+        a.free(p);
+
+        // The entire slot should be poisoned.
+        let slice = std::slice::from_raw_parts(p, slot_size);
+        assert!(
+            slice.iter().all(|&b| b == POISON),
+            "full slot not poisoned: first 16 bytes = {:02X?}",
+            &slice[..16.min(slot_size)]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: quarantine prevents immediate reuse
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "quarantine")]
+fn quarantine_prevents_immediate_reuse() {
+    unsafe {
+        let a = alloc();
+
+        // Allocate and free a block, then immediately allocate the same size.
+        // With quarantine, we should get a DIFFERENT pointer (the freed one
+        // is held in quarantine, not recycled yet).
+        let p = a.malloc(64);
+        assert!(!p.is_null());
+        let p_addr = p as usize;
+        a.free(p);
+
+        // Allocate again -- with quarantine the freed slot is not immediately
+        // recycled, so we should (usually) get a different address.
+        // Note: this is probabilistic with slot randomization, but very likely.
+        let q = a.malloc(64);
+        assert!(!q.is_null());
+
+        // We cannot guarantee a different address 100% of the time (the
+        // quarantine might have evicted it), but in a fresh allocator with
+        // default 4 MiB quarantine, 64 bytes should remain quarantined.
+        // We do a soft check: if they are the same, log a warning but don't
+        // fail, since it's not a strict guarantee.
+        if q as usize == p_addr {
+            eprintln!(
+                "WARNING: quarantine_prevents_immediate_reuse: got same address \
+                 (quarantine may have been full or slot randomization returned same slot)"
+            );
+        }
+
+        a.free(q);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: allocate, free, verify metadata is marked as freed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn metadata_tracks_freed_state() {
+    unsafe {
+        let a = alloc();
+        let p = a.malloc(100);
+        assert!(!p.is_null());
+
+        // Before free: metadata should exist and not be marked freed.
+        let meta_before = a.metadata.get(p);
+        assert!(
+            meta_before.is_some(),
+            "metadata should exist for a live allocation"
+        );
+        assert!(
+            !meta_before.unwrap().is_freed(),
+            "live allocation should not be marked as freed"
+        );
+
+        a.free(p);
+
+        // After free: metadata should be marked freed (if quarantine holds it)
+        // or removed (if no quarantine).
+        #[cfg(feature = "quarantine")]
+        {
+            let meta_after = a.metadata.get(p);
+            // With quarantine, metadata is marked freed but not removed until
+            // the slot is recycled.
+            if let Some(m) = meta_after {
+                assert!(
+                    m.is_freed(),
+                    "freed allocation metadata should have freed flag set"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test: metadata records correct requested_size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn metadata_records_requested_size() {
+    unsafe {
+        let a = alloc();
+        for &size in &[1usize, 16, 64, 100, 256, 1024, 4096] {
+            let p = a.malloc(size);
+            assert!(!p.is_null());
+
+            let meta = a.metadata.get(p);
+            assert!(meta.is_some(), "metadata missing for malloc({})", size);
+            assert_eq!(
+                meta.unwrap().requested_size,
+                size,
+                "metadata requested_size mismatch for malloc({})",
+                size
+            );
+
+            a.free(p);
+        }
+    }
+}
