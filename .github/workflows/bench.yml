@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -177,3 +178,9 @@ jobs:
             git commit -m "Update benchmark results [skip ci]"
             git push
           fi
+
+      - name: Trigger docs rebuild
+        if: always() && github.ref == 'refs/heads/main'
+        run: gh workflow run docs.yml --ref main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
