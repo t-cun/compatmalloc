@@ -3,7 +3,7 @@
 //! This provides O(1) lookup from any pointer to the slab (or large allocation) that owns it,
 //! eliminating all O(n) scans in free, recycle, and usable_size paths.
 //!
-//! Level 1: 2^14 entries (128KB) covering 128GB address space
+//! Level 1: 2^18 entries (~2MB, mmap'd) covering 2TB address space
 //! Level 2: lazily allocated, 2048 AtomicU64 entries per L1 slot covering individual 4KB pages
 //!
 //! Each L2 entry packs PageInfo into a single AtomicU64 to eliminate torn reads:
@@ -13,7 +13,7 @@
 //!   Bits [0..8): arena_index
 
 use crate::platform;
-use crate::util::PAGE_SIZE;
+use crate::util::page_size;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
@@ -98,8 +98,9 @@ const L2_SIZE: usize = 2048;
 /// Bits to shift page number to get L2 index.
 const L2_BITS: usize = 11; // log2(2048)
 
-/// Number of L1 entries. 2^14 = 16384 entries, covers 16384 * 2048 * 4KB = 128GB.
-const L1_BITS: usize = 14;
+/// Number of L1 entries. 2^18 = 262144 entries, covers 262144 * 2048 * 4KB = 2TB.
+/// The L1 table is mmap'd, so only touched pages consume physical memory (~2MB virtual).
+const L1_BITS: usize = 18;
 const L1_SIZE: usize = 1 << L1_BITS;
 
 /// A level-2 page map block: 2048 AtomicU64 entries for 2048 consecutive pages.
@@ -130,7 +131,7 @@ impl PageMap {
     /// Initialize the page map. Must be called once before use.
     pub unsafe fn init(&mut self) -> bool {
         let l1_bytes = L1_SIZE * core::mem::size_of::<AtomicPtr<L2Block>>();
-        let l1_bytes_aligned = crate::util::align_up(l1_bytes, PAGE_SIZE);
+        let l1_bytes_aligned = crate::util::align_up(l1_bytes, page_size());
         let mem = platform::map_anonymous(l1_bytes_aligned);
         if mem.is_null() {
             return false;
@@ -142,10 +143,11 @@ impl PageMap {
     }
 
     /// Extract L1 index and L2 index from a pointer.
-    #[inline]
+    /// Uses shift instead of division for ~30x fewer cycles.
+    #[inline(always)]
     fn indices(ptr: *mut u8) -> (usize, usize) {
         let addr = ptr as usize;
-        let page = addr / PAGE_SIZE;
+        let page = addr >> crate::util::page_shift();
         let l2_idx = page & (L2_SIZE - 1); // bits [0..11) of the page number
         let l1_idx = (page >> L2_BITS) & (L1_SIZE - 1); // bits [11..25) of the page number
         (l1_idx, l2_idx)
@@ -165,7 +167,7 @@ impl PageMap {
     #[cold]
     unsafe fn alloc_l2(&self, l1_idx: usize) -> *mut L2Block {
         let l2_bytes = core::mem::size_of::<L2Block>();
-        let l2_bytes_aligned = crate::util::align_up(l2_bytes, PAGE_SIZE);
+        let l2_bytes_aligned = crate::util::align_up(l2_bytes, page_size());
         let mem = platform::map_anonymous(l2_bytes_aligned);
         if mem.is_null() {
             return ptr::null_mut();
@@ -196,9 +198,9 @@ impl PageMap {
             return;
         }
         let packed = pack_slab(slab_ptr, class_index as u8, arena_index as u8);
-        let num_pages = (data_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let num_pages = (data_size + page_size() - 1) / page_size();
         for i in 0..num_pages {
-            let page_addr = data_start.add(i * PAGE_SIZE);
+            let page_addr = data_start.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
             let l2 = self.get_or_alloc_l2(l1_idx);
             if !l2.is_null() {
@@ -213,9 +215,9 @@ impl PageMap {
             return;
         }
         let packed = pack_large();
-        let num_pages = (data_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let num_pages = (data_size + page_size() - 1) / page_size();
         for i in 0..num_pages {
-            let page_addr = user_ptr.add(i * PAGE_SIZE);
+            let page_addr = user_ptr.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
             let l2 = self.get_or_alloc_l2(l1_idx);
             if !l2.is_null() {
@@ -229,9 +231,9 @@ impl PageMap {
         if !self.initialized.load(Ordering::Relaxed) {
             return;
         }
-        let num_pages = (data_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let num_pages = (data_size + page_size() - 1) / page_size();
         for i in 0..num_pages {
-            let page_addr = user_ptr.add(i * PAGE_SIZE);
+            let page_addr = user_ptr.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
             let slot = &*self.l1.add(l1_idx);
             let l2 = slot.load(Ordering::Acquire);

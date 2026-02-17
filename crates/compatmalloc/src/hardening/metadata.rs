@@ -1,6 +1,6 @@
 use crate::platform;
 use crate::sync::RawMutex;
-use crate::util::{align_up, PAGE_SIZE};
+use crate::util::{align_up, page_size};
 use core::cell::UnsafeCell;
 use core::ptr;
 
@@ -13,15 +13,15 @@ const FLAG_FREED: u8 = 0x01;
 #[repr(C)]
 pub struct AllocationMeta {
     pub requested_size: usize,
-    pub canary_value: u64,
+    pub checksum_value: u64,
     pub flags: u8,
 }
 
 impl AllocationMeta {
-    pub fn new(requested_size: usize, canary_value: u64) -> Self {
+    pub fn new(requested_size: usize, checksum_value: u64) -> Self {
         AllocationMeta {
             requested_size,
-            canary_value,
+            checksum_value,
             flags: 0,
         }
     }
@@ -87,6 +87,11 @@ impl MetadataTable {
         }
     }
 
+    /// Reset the lock. Only safe in single-threaded post-fork child.
+    pub unsafe fn reset_lock(&self) {
+        self.lock.force_unlock();
+    }
+
     /// Initialize the metadata table (must be called before use).
     pub unsafe fn init(&self) -> bool {
         let inner = &mut *self.inner.get();
@@ -94,7 +99,7 @@ impl MetadataTable {
     }
 
     unsafe fn init_inner(inner: &mut MetadataInner, capacity: usize) -> bool {
-        let size = align_up(capacity * core::mem::size_of::<MetaEntry>(), PAGE_SIZE);
+        let size = align_up(capacity * core::mem::size_of::<MetaEntry>(), page_size());
         let mem = platform::map_anonymous(size);
         if mem.is_null() {
             return false;
@@ -298,7 +303,7 @@ impl MetadataTable {
     /// then rehashes entries.
     unsafe fn grow(inner: &mut MetadataInner) {
         let new_capacity = inner.capacity * 2;
-        let new_size = align_up(new_capacity * core::mem::size_of::<MetaEntry>(), PAGE_SIZE);
+        let new_size = align_up(new_capacity * core::mem::size_of::<MetaEntry>(), page_size());
         let new_mem = platform::map_anonymous(new_size);
         if new_mem.is_null() {
             return;

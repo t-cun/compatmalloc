@@ -99,23 +99,21 @@ fn scenario_double_free() {
     unreachable!("double free was not detected");
 }
 
-/// Scenario: canary corruption. Allocate, write past the end, free.
+/// Scenario: canary corruption. Allocate, write past requested_size (overflow), free.
+/// With right-aligned layout, canaries exist in both the front gap [slot_base..user_ptr)
+/// and the back gap [user_ptr+requested_size..slot_end). For most small allocations
+/// with MIN_ALIGN=16, the front gap is 0 and the back gap contains the canary bytes.
 fn scenario_canary_corruption() {
     unsafe {
         let a = alloc();
-        // Request a small size that will have a gap in the slot (canary area).
-        // Size class 0 is 16 bytes; request fewer so there is a canary gap.
-        // Actually, to guarantee a canary gap we need requested_size < slot_size.
-        // Request 10 bytes -- the smallest size class is 16, so there is a
-        // 6-byte canary gap.
-        let requested = 10;
+        // Request 17 bytes -> slot_size=32. Back gap = 32 - 17 = 15 bytes of canary.
+        let requested = 17;
         let p = a.malloc(requested);
         assert!(!p.is_null());
 
-        // Corrupt the canary by writing past the requested size.
-        // The canary lives at bytes [requested..slot_size).
-        // Overwrite the first canary byte.
-        p.add(requested).write(0x00);
+        // Corrupt the back-gap canary by writing one byte past the requested size.
+        let after = p.add(requested);
+        after.write(0x00);
 
         // Freeing should detect the corrupted canary and abort.
         a.free(p);

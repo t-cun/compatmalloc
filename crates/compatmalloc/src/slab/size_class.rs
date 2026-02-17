@@ -115,17 +115,26 @@ pub fn fast_div_slot(offset: usize, class_index: usize) -> usize {
     ((offset as u128 * magic as u128) >> 64) as usize
 }
 
-/// Number of slots per slab for a given size class.
-/// We target ~64 KiB per slab, with a minimum of 16 slots.
-pub fn slots_per_slab(class_index: usize) -> usize {
-    let sz = SIZE_CLASSES[class_index];
-    let target = 65536; // 64 KiB
-    let count = target / sz;
-    if count < 16 {
-        16
-    } else {
-        count
+/// Precomputed slots-per-slab table. Eliminates a ~35-cycle hardware division
+/// from the hot free path (slot_for_ptr calls slots_per_slab on every free).
+static SLOTS_PER_SLAB: [usize; NUM_SIZE_CLASSES] = {
+    let mut table = [0usize; NUM_SIZE_CLASSES];
+    let target = 65536usize; // 64 KiB
+    let mut i = 0;
+    while i < NUM_SIZE_CLASSES {
+        let sz = SIZE_CLASSES[i];
+        let count = target / sz;
+        table[i] = if count < 16 { 16 } else { count };
+        i += 1;
     }
+    table
+};
+
+/// Number of slots per slab for a given size class.
+/// Uses precomputed table for O(1) lookup (no division).
+#[inline(always)]
+pub fn slots_per_slab(class_index: usize) -> usize {
+    SLOTS_PER_SLAB[class_index]
 }
 
 /// Total memory needed for a slab of a given class (just the slot data, no metadata).

@@ -4,18 +4,19 @@ use crate::slab::bitmap::SlabBitmap;
 use crate::slab::page_map;
 use crate::slab::size_class::{self, NUM_SIZE_CLASSES};
 use crate::sync::RawMutex;
-use crate::util::{align_up, PAGE_SIZE};
+use crate::util::align_up;
 use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-slot metadata stored inline in the slab header.
 /// Eliminates all hashing, locking, and backward-shift deletion from the hot path.
+/// Field order optimized: u64 first to avoid alignment padding (16 bytes vs 24).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SlotMeta {
+    pub checksum: u64,
     pub requested_size: u32,
-    pub canary: u64,
     pub flags: u8,
     _pad: [u8; 3],
 }
@@ -26,7 +27,7 @@ impl SlotMeta {
     pub const fn empty() -> Self {
         SlotMeta {
             requested_size: 0,
-            canary: 0,
+            checksum: 0,
             flags: 0,
             _pad: [0; 3],
         }
@@ -44,8 +45,8 @@ impl SlotMeta {
 
     #[inline(always)]
     pub fn clear(&mut self) {
+        self.checksum = 0;
         self.requested_size = 0;
-        self.canary = 0;
         self.flags = 0;
     }
 }
@@ -83,11 +84,11 @@ impl Slab {
         let slab_header_size = core::mem::size_of::<Slab>();
 
         let header_and_bitmap_and_meta =
-            align_up(slab_header_size + bitmap_bytes + meta_bytes, PAGE_SIZE);
-        let data_pages = align_up(data_size, PAGE_SIZE);
+            align_up(slab_header_size + bitmap_bytes + meta_bytes, crate::util::page_size());
+        let data_pages = align_up(data_size, crate::util::page_size());
 
         #[cfg(feature = "guard-pages")]
-        let total_size = PAGE_SIZE + header_and_bitmap_and_meta + data_pages + PAGE_SIZE;
+        let total_size = crate::util::page_size() + header_and_bitmap_and_meta + data_pages + crate::util::page_size();
         #[cfg(not(feature = "guard-pages"))]
         let total_size = header_and_bitmap_and_meta + data_pages;
 
@@ -98,15 +99,15 @@ impl Slab {
 
         #[cfg(feature = "guard-pages")]
         {
-            platform::protect_none(base, PAGE_SIZE);
+            platform::protect_none(base, crate::util::page_size());
             platform::protect_none(
-                base.add(PAGE_SIZE + header_and_bitmap_and_meta + data_pages),
-                PAGE_SIZE,
+                base.add(crate::util::page_size() + header_and_bitmap_and_meta + data_pages),
+                crate::util::page_size(),
             );
         }
 
         #[cfg(feature = "guard-pages")]
-        let header_ptr = base.add(PAGE_SIZE) as *mut Slab;
+        let header_ptr = base.add(crate::util::page_size()) as *mut Slab;
         #[cfg(not(feature = "guard-pages"))]
         let header_ptr = base as *mut Slab;
 
@@ -141,23 +142,42 @@ impl Slab {
         header_ptr
     }
 
+    /// Get the base address of a slot (start of the slot region).
     #[inline(always)]
-    pub unsafe fn slot_ptr(&self, slot: usize) -> *mut u8 {
+    pub unsafe fn slot_base(&self, slot: usize) -> *mut u8 {
         let slot_sz = size_class::slot_size(self.class_index);
         self.data.add(slot * slot_sz)
     }
 
+    /// Get the right-aligned user pointer within a slot.
+    /// User data is placed at the end of the slot so forward overflows
+    /// hit the guard page (or next slot's front-gap canary).
+    ///
+    /// Layout: [front_gap][user_data] within slot
+    ///
+    /// The gap is aligned to `align` to preserve alignment guarantees.
+    /// For regular malloc, pass MIN_ALIGN. For memalign, pass the requested alignment.
+    #[inline(always)]
+    pub unsafe fn slot_user_ptr(&self, slot: usize, requested_size: usize, align: usize) -> *mut u8 {
+        let slot_sz = size_class::slot_size(self.class_index);
+        let base = self.data.add(slot * slot_sz);
+        let aligned_size = align_up(requested_size, crate::util::MIN_ALIGN);
+        if aligned_size >= slot_sz {
+            base
+        } else {
+            let gap = crate::util::align_down(slot_sz - aligned_size, align);
+            base.add(gap)
+        }
+    }
+
     /// Compute slot index from pointer using division-free magic multiply.
+    /// Accepts interior pointers (right-aligned user ptrs within a slot).
     #[inline(always)]
     pub fn slot_for_ptr(&self, ptr: *mut u8) -> Option<usize> {
         let offset = ptr as usize - self.data as usize;
-        let slot_sz = size_class::slot_size(self.class_index);
         // Use magic multiplier instead of hardware div (~4 cycles vs ~25 cycles)
+        // floor(offset / slot_sz) correctly maps any interior pointer to its slot
         let slot = size_class::fast_div_slot(offset, self.class_index);
-        // Verify alignment: slot * slot_sz must equal offset
-        if slot * slot_sz != offset {
-            return None;
-        }
         let num_slots = size_class::slots_per_slab(self.class_index);
         if slot < num_slots {
             Some(slot)
@@ -234,6 +254,11 @@ impl Arena {
         }
     }
 
+    /// Reset the arena lock. Only safe in single-threaded post-fork child.
+    pub unsafe fn reset_lock(&self) {
+        self.lock.force_unlock();
+    }
+
     /// Set the arena index (called during init).
     pub fn set_arena_index(&mut self, idx: usize) {
         self.arena_index = idx;
@@ -270,7 +295,7 @@ impl Arena {
                         let slot_meta = slab.get_slot_meta(slot);
                         let mut alloc_meta = AllocationMeta::new(
                             slot_meta.requested_size as usize,
-                            slot_meta.canary,
+                            slot_meta.checksum,
                         );
                         if slot_meta.is_freed() {
                             alloc_meta.mark_freed();
@@ -344,39 +369,45 @@ impl Arena {
         #[cfg(not(feature = "slot-randomization"))]
         let slot = slab.bitmap.alloc_first_free()?;
 
-        let ptr = slab.slot_ptr(slot);
+        // Right-aligned: user pointer is at end of slot
+        let user_ptr = slab.slot_user_ptr(slot, size, crate::util::MIN_ALIGN);
 
         // Write metadata directly to per-slab array (no hash, no lock)
         let meta = slab.get_slot_meta_mut(slot);
 
+        meta.requested_size = size as u32;
+        meta.flags = 0;
+
+        let slot_base = slab.slot_base(slot);
+
+        // Always compute metadata integrity checksum
+        meta.checksum = crate::hardening::integrity::compute_checksum(
+            slot_base as usize,
+            meta.requested_size,
+            meta.flags,
+        );
+
+        // Use checksum value as canary for gap fill
         #[cfg(feature = "canaries")]
         {
             let slot_sz = size_class::slot_size(slab.class_index);
-            let gap = slot_sz - size;
-            if gap > 0 {
-                let canary = crate::hardening::canary::generate_canary(ptr);
-                crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
-                meta.canary = canary;
-            } else {
-                meta.canary = 0;
+            let front_gap = user_ptr as usize - slot_base as usize;
+            if front_gap > 0 {
+                crate::hardening::canary::write_canary_front(slot_base, front_gap, meta.checksum);
             }
-            meta.requested_size = size as u32;
-            meta.flags = 0;
+            let effective_slot_sz = slot_sz - front_gap;
+            if size < effective_slot_sz {
+                crate::hardening::canary::write_canary(user_ptr, size, effective_slot_sz, meta.checksum);
+            }
         }
 
-        #[cfg(not(feature = "canaries"))]
-        {
-            meta.requested_size = size as u32;
-            meta.canary = 0;
-            meta.flags = 0;
-        }
-
-        Some(ptr)
+        Some(user_ptr)
     }
 
     /// Batch-allocate raw slots for thread cache. Returns the number of slots allocated.
     /// Slots are "allocated" in the bitmap but no metadata is set up.
     /// The caller is responsible for setting up metadata before handing to the user.
+    /// Stores slot_base in CachedSlot.ptr (size not known during batch fill).
     pub unsafe fn alloc_batch_raw(
         &self,
         class_index: usize,
@@ -402,7 +433,7 @@ impl Arena {
                 match slot_opt {
                     Some(slot) => {
                         buf[count] = crate::allocator::thread_cache::CachedSlot {
-                            ptr: slab.slot_ptr(slot),
+                            ptr: slab.slot_base(slot),
                             slab_ptr: slab as *mut Slab as *mut u8,
                             slot_index: slot as u16,
                             arena_index: self.arena_index as u8,
@@ -433,7 +464,7 @@ impl Arena {
                     match slot_opt {
                         Some(slot) => {
                             buf[count] = crate::allocator::thread_cache::CachedSlot {
-                                ptr: slab.slot_ptr(slot),
+                                ptr: slab.slot_base(slot),
                                 slab_ptr: slab as *mut Slab as *mut u8,
                                 slot_index: slot as u16,
                                 arena_index: self.arena_index as u8,
@@ -472,42 +503,58 @@ impl Arena {
         self.lock.unlock();
     }
 
-    /// Set up metadata for a cached allocation slot.
+    /// Set up metadata for a cached allocation slot and compute the right-aligned user pointer.
     /// Writes directly to per-slab inline metadata -- NO lock needed.
+    /// Returns the right-aligned user pointer.
+    /// `align` controls the gap alignment (MIN_ALIGN for regular malloc, requested alignment for memalign).
     #[inline(always)]
     pub unsafe fn setup_cached_alloc_metadata(
         &self,
         slab_raw: *mut u8,
         slot_index: u16,
-        ptr: *mut u8,
+        slot_base_ptr: *mut u8,
         size: usize,
         class_idx: usize,
-    ) {
+        align: usize,
+    ) -> *mut u8 {
         let slab = &*(slab_raw as *mut Slab);
         let meta = slab.get_slot_meta_mut(slot_index as usize);
 
+        let slot_sz = size_class::slot_size(class_idx);
+        let aligned_size = align_up(size, crate::util::MIN_ALIGN);
+        let gap = if aligned_size >= slot_sz { 0 } else {
+            crate::util::align_down(slot_sz - aligned_size, align)
+        };
+        let user_ptr = slot_base_ptr.add(gap);
+
+        meta.requested_size = size as u32;
+        meta.flags = 0;
+
+        // Always compute metadata integrity checksum
+        meta.checksum = crate::hardening::integrity::compute_checksum(
+            slot_base_ptr as usize,
+            meta.requested_size,
+            meta.flags,
+        );
+
+        // Use checksum value as canary for gap fill
         #[cfg(feature = "canaries")]
         {
-            let slot_sz = size_class::slot_size(class_idx);
-            let gap = slot_sz - size;
             if gap > 0 {
-                // Only generate and write canary when there's a gap to protect
-                let canary = crate::hardening::canary::generate_canary(ptr);
-                crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
-                meta.canary = canary;
-            } else {
-                meta.canary = 0;
+                crate::hardening::canary::write_canary_front(slot_base_ptr, gap, meta.checksum);
             }
-            meta.requested_size = size as u32;
-            meta.flags = 0;
+            let effective_slot_sz = slot_sz - gap;
+            if size < effective_slot_sz {
+                crate::hardening::canary::write_canary(user_ptr, size, effective_slot_sz, meta.checksum);
+            }
         }
 
         #[cfg(not(feature = "canaries"))]
         {
-            meta.requested_size = size as u32;
-            meta.canary = 0;
-            meta.flags = 0;
+            let _ = gap;
         }
+
+        user_ptr
     }
 
     /// Free a pointer using direct slab info from the page map (O(1) path).
@@ -597,20 +644,43 @@ impl Arena {
             crate::hardening::abort_with_message("compatmalloc: double free detected\n");
         }
 
-        let requested_size = meta.requested_size as usize;
-
-        #[cfg(any(feature = "canaries", feature = "poison-on-free"))]
         let slot_sz = size_class::slot_size(slab.class_index);
+        let slot_base = slab.slot_base(slot_idx);
+
+        // Always verify metadata integrity checksum
+        if !crate::hardening::integrity::verify_checksum(
+            slot_base as usize,
+            meta.requested_size,
+            meta.flags,
+            meta.checksum,
+        ) {
+            crate::hardening::abort_with_message(
+                "compatmalloc: metadata integrity check failed\n",
+            );
+        }
 
         #[cfg(feature = "canaries")]
         {
-            let gap = slot_sz - requested_size;
-            if gap > 0
+            let requested_size = meta.requested_size as usize;
+            let front_gap = ptr as usize - slot_base as usize;
+            if front_gap > 0
+                && !crate::hardening::canary::check_canary_front(
+                    slot_base,
+                    front_gap,
+                    meta.checksum,
+                )
+            {
+                crate::hardening::abort_with_message(
+                    "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
+                );
+            }
+            let effective_slot_sz = slot_sz - front_gap;
+            if requested_size < effective_slot_sz
                 && !crate::hardening::canary::check_canary(
                     ptr,
                     requested_size,
-                    slot_sz,
-                    meta.canary,
+                    effective_slot_sz,
+                    meta.checksum,
                 )
             {
                 crate::hardening::abort_with_message(
@@ -622,23 +692,26 @@ impl Arena {
         meta.mark_freed();
 
         // Zero (information leak defense) or poison (UAF detection).
+        // Use slot_base for full slot coverage.
         #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
         {
-            ptr::write_bytes(ptr, 0, requested_size);
+            ptr::write_bytes(slot_base, 0, slot_sz);
         }
 
         #[cfg(feature = "poison-on-free")]
         {
-            crate::hardening::poison::poison_region(ptr, slot_sz);
+            crate::hardening::poison::poison_region(slot_base, slot_sz);
         }
 
-        slab.ever_freed.store(true, Ordering::Relaxed);
+        if !slab.ever_freed.load(Ordering::Relaxed) {
+            slab.ever_freed.store(true, Ordering::Release);
+        }
 
         #[cfg(feature = "quarantine")]
         {
             use crate::hardening::quarantine::QuarantineEntry;
             let q_entry = QuarantineEntry {
-                ptr,
+                ptr: slot_base,
                 size: size_class::slot_size(slab.class_index),
                 slab_ptr: slab as *mut Slab as *mut u8,
                 slot_index: slot_idx,
@@ -665,14 +738,16 @@ impl Arena {
     unsafe fn free_from_slab_prechecked(
         inner: &mut ArenaInner,
         slab: &mut Slab,
-        ptr: *mut u8,
+        _ptr: *mut u8,
         slot_idx: usize,
     ) {
         #[cfg(feature = "quarantine")]
         {
             use crate::hardening::quarantine::QuarantineEntry;
+            // Use slot_base (not user pointer) so poison checks cover the full slot
+            let slot_base = slab.slot_base(slot_idx);
             let q_entry = QuarantineEntry {
-                ptr,
+                ptr: slot_base,
                 size: size_class::slot_size(slab.class_index),
                 slab_ptr: slab as *mut Slab as *mut u8,
                 slot_index: slot_idx,
@@ -711,9 +786,16 @@ impl Arena {
 
         if !entry.slab_ptr.is_null() {
             let slab = &mut *(entry.slab_ptr as *mut Slab);
-            // Clear per-slab metadata (no hash table removal needed)
             slab.get_slot_meta_mut(entry.slot_index).clear();
             slab.bitmap.free_slot(entry.slot_index);
+
+            // If slab is fully empty, return physical pages to kernel
+            if slab.bitmap.free_count() == slab.bitmap.num_slots() {
+                let data_size = size_class::slots_per_slab(entry.class_index)
+                    * size_class::slot_size(entry.class_index);
+                let data_pages = crate::util::align_up(data_size, crate::util::page_size());
+                crate::platform::advise_free(slab.data, data_pages);
+            }
         }
     }
 
@@ -721,7 +803,7 @@ impl Arena {
     /// Safe to call without the arena lock -- ever_freed is an AtomicBool.
     pub unsafe fn slab_ever_freed(&self, slab_raw: *mut u8) -> bool {
         let slab = &*(slab_raw as *mut Slab);
-        slab.ever_freed.load(Ordering::Relaxed)
+        slab.ever_freed.load(Ordering::Acquire)
     }
 
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
@@ -736,6 +818,109 @@ impl Arena {
         self.lock.lock();
         let inner = &*self.inner.get();
         let result = Self::usable_size_inner(inner, ptr);
+        self.lock.unlock();
+        result
+    }
+
+    /// Scan all slabs in this arena and verify integrity of allocated slots.
+    /// Returns an IntegrityResult with counts of errors found.
+    pub unsafe fn check_integrity(&self) -> crate::hardening::self_check::IntegrityResult {
+        use crate::hardening::self_check::IntegrityResult;
+
+        let mut result = IntegrityResult::default();
+
+        self.lock.lock();
+        let inner = &*self.inner.get();
+
+        for list in &inner.slab_lists {
+            let mut slab_ptr = list.head;
+            while !slab_ptr.is_null() {
+                let slab = &*slab_ptr;
+                result.total_slabs += 1;
+
+                let slot_sz = size_class::slot_size(slab.class_index);
+                let num_slots = size_class::slots_per_slab(slab.class_index);
+
+                for slot in 0..num_slots {
+                    let is_allocated = slab.bitmap.is_allocated(slot);
+                    let meta = slab.get_slot_meta(slot);
+
+                    if !is_allocated {
+                        // Free slot: metadata should be cleared
+                        if meta.requested_size != 0 && !meta.is_freed() {
+                            result.bitmap_inconsistencies += 1;
+                            result.errors_found += 1;
+                        }
+                        continue;
+                    }
+
+                    result.total_slots_checked += 1;
+
+                    if meta.is_freed() {
+                        // Allocated in bitmap but marked freed in metadata
+                        // This is valid if in quarantine, so only count as inconsistency
+                        // if quarantine is not enabled
+                        #[cfg(not(feature = "quarantine"))]
+                        {
+                            result.bitmap_inconsistencies += 1;
+                            result.errors_found += 1;
+                        }
+                        continue;
+                    }
+
+                    // Verify metadata integrity checksum
+                    let slot_base = slab.slot_base(slot);
+                    if !crate::hardening::integrity::verify_checksum(
+                        slot_base as usize,
+                        meta.requested_size,
+                        meta.flags,
+                        meta.checksum,
+                    ) {
+                        result.checksum_failures += 1;
+                        result.errors_found += 1;
+                        continue;
+                    }
+
+                    // Verify canary bytes if enabled
+                    #[cfg(feature = "canaries")]
+                    {
+                        let requested_size = meta.requested_size as usize;
+                        let aligned_size = align_up(requested_size, crate::util::MIN_ALIGN);
+                        let gap = if aligned_size >= slot_sz { 0 } else {
+                            crate::util::align_down(slot_sz - aligned_size, crate::util::MIN_ALIGN)
+                        };
+                        // Check front-gap canary
+                        if gap > 0
+                            && !crate::hardening::canary::check_canary_front(
+                                slot_base,
+                                gap,
+                                meta.checksum,
+                            )
+                        {
+                            result.canary_failures += 1;
+                            result.errors_found += 1;
+                        }
+                        // Check back-gap canary
+                        let user_ptr = slot_base.add(gap);
+                        let effective_slot_sz = slot_sz - gap;
+                        if requested_size < effective_slot_sz
+                            && !crate::hardening::canary::check_canary(
+                                user_ptr,
+                                requested_size,
+                                effective_slot_sz,
+                                meta.checksum,
+                            )
+                        {
+                            result.canary_failures += 1;
+                            result.errors_found += 1;
+                        }
+                    }
+                }
+
+                slab_ptr = slab.next;
+            }
+        }
+
         self.lock.unlock();
         result
     }

@@ -91,6 +91,18 @@ impl ClassCache {
         }
     }
 
+    /// Pop the most recent entry from the free buffer (LIFO).
+    /// Used for direct recycling when alloc cache is empty.
+    #[inline]
+    fn pop_free(&mut self) -> Option<CachedSlot> {
+        if self.free_count > 0 {
+            self.free_count -= 1;
+            Some(self.free_slots[self.free_count])
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn free_is_full(&self) -> bool {
         self.free_count >= FREE_CACHE_SIZE
@@ -182,6 +194,13 @@ impl ThreadCache {
         self.caches[class_index].free_is_full()
     }
 
+    /// Pop directly from the free buffer for a size class.
+    /// Fast path for tight malloc/free loops: skip the recycle copy.
+    #[inline]
+    pub fn pop_free(&mut self, class_index: usize) -> Option<CachedSlot> {
+        self.caches[class_index].pop_free()
+    }
+
     /// Recycle free buffer entries to alloc cache (lock-free fast path).
     /// Returns the number of entries remaining in the free buffer.
     #[inline]
@@ -225,6 +244,12 @@ struct ThreadState {
     tid: usize,
     rng: u64,
     active: bool,
+    /// Fork generation at last access. On mismatch, cache is stale.
+    generation: u64,
+    /// Cached arena index (computed once per thread, avoids splitmix64 per alloc).
+    cached_arena_idx: usize,
+    /// Whether the arena index has been computed.
+    arena_idx_valid: bool,
 }
 
 impl ThreadState {
@@ -234,6 +259,24 @@ impl ThreadState {
             tid: 0,
             rng: 0,
             active: false,
+            generation: 0,
+            cached_arena_idx: 0,
+            arena_idx_valid: false,
+        }
+    }
+
+    /// Check and handle fork generation mismatch.
+    /// After fork, thread caches contain stale pointers from the parent;
+    /// clear everything and reset thread identity.
+    #[inline]
+    fn check_fork_generation(&mut self) {
+        let current_gen = crate::hardening::fork::fork_generation();
+        if self.generation != current_gen {
+            self.cache = ThreadCache::new();
+            self.tid = 0;
+            self.rng = 0;
+            self.arena_idx_valid = false;
+            self.generation = current_gen;
         }
     }
 
@@ -246,6 +289,19 @@ impl ThreadState {
         let new_tid = unsafe { libc::syscall(libc::SYS_gettid) as usize };
         self.tid = new_tid;
         new_tid
+    }
+
+    /// Get or compute the arena index for this thread.
+    #[inline]
+    fn arena_index(&mut self, num_arenas: usize) -> usize {
+        if self.arena_idx_valid {
+            return self.cached_arena_idx;
+        }
+        let tid = self.thread_id();
+        let idx = crate::platform::splitmix64(tid as u64) as usize % num_arenas;
+        self.cached_arena_idx = idx;
+        self.arena_idx_valid = true;
+        idx
     }
 
     /// Get a fast random u64 using xorshift64*.
@@ -288,7 +344,11 @@ where
             // Reentrant call (e.g., recursive malloc from thread_local init)
             return None;
         }
+        // Set active flag for reentrancy guard. With panic = "abort" (release mode),
+        // no unwind can occur, so a simple set/reset is safe. In debug mode, a
+        // reentrant panic would abort anyway.
         state.active = true;
+        state.check_fork_generation();
         let result = f(state);
         state.active = false;
         Some(result)
@@ -317,6 +377,20 @@ where
     with_thread_state(|state| {
         let tid = state.thread_id();
         f(&mut state.cache, tid)
+    })
+}
+
+/// Access cache, arena index, and thread ID.
+/// Arena index is cached per-thread (computed once per thread lifetime).
+#[inline(always)]
+pub fn with_cache_tid_arena<F, R>(f: F, num_arenas: usize) -> Option<R>
+where
+    F: FnOnce(&mut ThreadCache, usize, usize) -> R,
+{
+    with_thread_state(|state| {
+        let tid = state.thread_id();
+        let arena_idx = state.arena_index(num_arenas);
+        f(&mut state.cache, tid, arena_idx)
     })
 }
 

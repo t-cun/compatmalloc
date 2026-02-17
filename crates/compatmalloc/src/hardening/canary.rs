@@ -110,3 +110,48 @@ pub unsafe fn check_canary(
     }
     diff == 0
 }
+
+/// Write canary bytes to the front gap (before user data in right-aligned layout).
+///
+/// # Safety
+/// `slot_base` must point to a valid slot region. `gap` bytes from slot_base
+/// are the front canary region.
+#[inline]
+pub unsafe fn write_canary_front(slot_base: *mut u8, gap: usize, canary: u64) {
+    if gap == 0 {
+        return;
+    }
+    let canary_bytes = canary.to_le_bytes();
+    let mut i = 0;
+    while i < gap {
+        slot_base.add(i).write(canary_bytes[i % 8]);
+        i += 1;
+    }
+}
+
+/// Check front-gap canary bytes (constant-time).
+///
+/// # Safety
+/// `slot_base` must point to a valid slot region with at least `gap` readable bytes.
+#[inline]
+pub unsafe fn check_canary_front(slot_base: *mut u8, gap: usize, canary: u64) -> bool {
+    if gap == 0 {
+        return true;
+    }
+    let canary_bytes = canary.to_le_bytes();
+    let mut diff: u8 = 0;
+    let mut i = 0;
+    while i < gap {
+        diff |= slot_base.add(i).read() ^ canary_bytes[i % 8];
+        i += 1;
+    }
+    diff == 0
+}
+
+/// Get the canary secret for use by integrity checksums.
+/// Uses Relaxed ordering since the secret is initialized once during init
+/// (which happens-before any allocation) and never changes.
+#[inline(always)]
+pub fn secret() -> u64 {
+    CANARY_SECRET.load(Ordering::Relaxed)
+}

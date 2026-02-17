@@ -1,6 +1,9 @@
 pub mod metadata;
+pub mod fork;
+pub mod integrity;
+pub mod self_check;
 
-#[cfg(feature = "canaries")]
+// canary module is always compiled (integrity.rs uses canary::secret())
 pub mod canary;
 
 #[cfg(feature = "poison-on-free")]
@@ -13,6 +16,8 @@ pub mod guard_pages;
 
 /// Abort with a diagnostic message to stderr.
 /// This is used when unrecoverable corruption is detected.
+#[cold]
+#[inline(never)]
 pub fn abort_with_message(msg: &str) -> ! {
     unsafe {
         // Write directly to stderr fd (2) -- no allocation needed

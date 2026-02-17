@@ -81,6 +81,15 @@ impl RawMutex {
         }
     }
 
+    /// Force-unlock the mutex by storing 0 to state.
+    /// Only safe in single-threaded context (e.g., post-fork child process).
+    ///
+    /// # Safety
+    /// Caller must ensure no other threads exist (single-threaded post-fork).
+    pub unsafe fn force_unlock(&self) {
+        self.state.store(0, Ordering::Release);
+    }
+
     /// Try to lock without blocking. Returns true if lock was acquired.
     #[inline]
     pub fn try_lock(&self) -> bool {

@@ -48,6 +48,9 @@ pub unsafe fn compatmalloc_init() {
         Err(_) => return,
     }
 
+    // Initialize page size from OS before anything else
+    crate::util::init_page_size();
+
     // Resolve real libc functions first (needed for passthrough and bootstrap)
     passthrough::resolve_real_functions();
 
@@ -60,10 +63,14 @@ pub unsafe fn compatmalloc_init() {
         return;
     }
 
-    // Initialize canary secret from getrandom(2)
-    #[cfg(feature = "canaries")]
+    // Initialize canary secret from getrandom(2) -- used for canaries and
+    // metadata integrity checksums
+    crate::hardening::canary::init_canary_secret();
+
+    // Try to enable ARM64 MTE if available
+    #[cfg(feature = "mte")]
     {
-        crate::hardening::canary::init_canary_secret();
+        crate::platform::mte::init();
     }
 
     // Initialize the hardened allocator
@@ -71,6 +78,9 @@ pub unsafe fn compatmalloc_init() {
         INIT_STATE.store(DISABLED, Ordering::Release);
         return;
     }
+
+    // Register fork safety handlers
+    crate::hardening::fork::register_atfork();
 
     INIT_STATE.store(READY, Ordering::Release);
 }

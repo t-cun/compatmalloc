@@ -71,6 +71,11 @@ impl LargeAllocator {
         }
     }
 
+    /// Reset the lock. Only safe in single-threaded post-fork child.
+    pub unsafe fn reset_lock(&self) {
+        self.lock.force_unlock();
+    }
+
     pub unsafe fn alloc(&self, size: usize, metadata: &MetadataTable) -> *mut u8 {
         let alloc = match LargeAlloc::create(size) {
             Some(a) => a,

@@ -26,6 +26,7 @@ canaries = []
 poison-on-free = []
 write-after-free-check = []
 zero-on-free = []
+mte = []
 
 [dependencies]
 libc = "0.2"

@@ -1,20 +1,26 @@
 use crate::allocator::passthrough;
-use crate::init::{self, STATE_DISABLED, STATE_READY};
+use crate::init::{self, STATE_READY};
 use core::ffi::c_void;
 use core::ptr;
 
 /// Dispatch macro: check init state and route to hardened or passthrough.
+/// Hot path: single branch on STATE_READY (most common).
+/// Cold path: slow_dispatch handles UNINIT and DISABLED cases.
 macro_rules! dispatch {
     ($hardened_fn:expr, $passthrough_fn:expr) => {{
-        match init::state() {
-            STATE_READY => $hardened_fn,
-            STATE_DISABLED => $passthrough_fn,
-            _ => {
+        if init::state() == STATE_READY {
+            $hardened_fn
+        } else {
+            #[cold]
+            #[inline(never)]
+            unsafe fn slow_init() {
                 init::ensure_initialized();
-                match init::state() {
-                    STATE_READY => $hardened_fn,
-                    _ => $passthrough_fn,
-                }
+            }
+            slow_init();
+            if init::state() == STATE_READY {
+                $hardened_fn
+            } else {
+                $passthrough_fn
             }
         }
     }};
@@ -115,20 +121,20 @@ pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void 
 
 #[no_mangle]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
-    let page_size = crate::util::PAGE_SIZE;
+    let ps = crate::util::page_size();
     dispatch!(
-        init::allocator().memalign(page_size, size) as *mut c_void,
-        passthrough::memalign(page_size, size) as *mut c_void
+        init::allocator().memalign(ps, size) as *mut c_void,
+        passthrough::memalign(ps, size) as *mut c_void
     )
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
-    let page_size = crate::util::PAGE_SIZE;
-    let rounded = crate::util::align_up(size, page_size);
+    let ps = crate::util::page_size();
+    let rounded = crate::util::align_up(size, ps);
     dispatch!(
-        init::allocator().memalign(page_size, rounded) as *mut c_void,
-        passthrough::memalign(page_size, rounded) as *mut c_void
+        init::allocator().memalign(ps, rounded) as *mut c_void,
+        passthrough::memalign(ps, rounded) as *mut c_void
     )
 }
 
@@ -165,4 +171,19 @@ pub unsafe extern "C" fn mallinfo() -> libc::mallinfo {
 #[no_mangle]
 pub unsafe extern "C" fn mallinfo2() -> libc::mallinfo2 {
     core::mem::zeroed()
+}
+
+// ============================================================================
+// Integrity check API
+// ============================================================================
+
+/// Scan all arenas and verify integrity of all allocated slots.
+/// Returns 0 on success, or the number of errors found on corruption.
+#[no_mangle]
+pub unsafe extern "C" fn compatmalloc_check_integrity() -> libc::c_int {
+    if init::state() != STATE_READY {
+        return 0;
+    }
+    let result = init::allocator().check_integrity();
+    result.errors_found as libc::c_int
 }

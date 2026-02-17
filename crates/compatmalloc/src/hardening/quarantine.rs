@@ -1,5 +1,5 @@
 use crate::platform;
-use crate::util::{align_up, DEFAULT_QUARANTINE_BYTES, PAGE_SIZE};
+use crate::util::{align_up, page_size, DEFAULT_QUARANTINE_BYTES};
 
 /// Default quarantine slots per arena (reduced from 1024 for memory savings).
 const DEFAULT_QUARANTINE_SLOTS: usize = 256;
@@ -63,7 +63,7 @@ impl QuarantineRing {
         let cap = DEFAULT_QUARANTINE_SLOTS;
         let bytes = align_up(
             cap * core::mem::size_of::<QuarantineEntry>(),
-            PAGE_SIZE,
+            page_size(),
         );
         let mem = platform::map_anonymous(bytes);
         if mem.is_null() {

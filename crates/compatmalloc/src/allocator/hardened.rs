@@ -91,7 +91,7 @@ impl HardenedAllocator {
         match size_class_index(alloc_size) {
             Some(class_idx) => {
                 // Thread cache fast path: try to reuse a cached slot
-                if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx) {
+                if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx, MIN_ALIGN) {
                     return ptr;
                 }
                 let arena = self.select_arena();
@@ -107,33 +107,50 @@ impl HardenedAllocator {
     /// Try to allocate from the thread cache. Returns the pointer if successful.
     /// On cache miss, first tries to recycle from the free buffer (lock-free!),
     /// then falls back to batch-fill from the arena.
-    /// Uses consolidated TLS access (cache + tid) to avoid reentrant TLS.
+    /// Uses consolidated TLS access (cache + tid + arena_idx) to avoid reentrant TLS.
     #[inline(always)]
-    unsafe fn try_cache_alloc(&self, size: usize, class_idx: usize) -> Option<*mut u8> {
+    unsafe fn try_cache_alloc(&self, size: usize, class_idx: usize, align: usize) -> Option<*mut u8> {
         use crate::allocator::thread_cache::{self, CachedSlot};
 
-        thread_cache::with_cache_and_tid(|cache, tid| {
+        thread_cache::with_cache_tid_arena(|cache, _tid, arena_idx| {
             // Fast path: pop from alloc cache
             if let Some(cached) = cache.pop(class_idx) {
-                let arena_idx = cached.arena_index as usize;
-                if arena_idx < self.num_arenas {
-                    self.arenas[arena_idx].setup_cached_alloc_metadata(
+                let cached_arena = cached.arena_index as usize;
+                if cached_arena < self.num_arenas {
+                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
                         cached.slab_ptr,
                         cached.slot_index,
                         cached.ptr,
                         size,
                         class_idx,
+                        align,
                     );
-                    return Some(cached.ptr);
+                    return Some(user_ptr);
                 }
             }
 
-            // Cache miss: try recycling from free buffer first (no lock!)
+            // Quick path: pop directly from free buffer (avoids recycle copy overhead
+            // in tight malloc/free loops where alloc cache is always empty)
+            if let Some(cached) = cache.pop_free(class_idx) {
+                let cached_arena = cached.arena_index as usize;
+                if cached_arena < self.num_arenas {
+                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
+                        cached.slab_ptr,
+                        cached.slot_index,
+                        cached.ptr,
+                        size,
+                        class_idx,
+                        align,
+                    );
+                    return Some(user_ptr);
+                }
+            }
+
+            // Full recycle: move remaining free buffer entries to alloc cache
             let remaining = cache.recycle_frees(class_idx, 32);
 
             // Flush oldest remaining entries to arena for quarantine (amortized)
             if remaining > 0 {
-                let arena_idx = platform::splitmix64(tid as u64) as usize % self.num_arenas;
                 let (buf, count) = cache.drain_frees(class_idx);
                 if count > 0 {
                     self.arenas[arena_idx].free_batch_deferred(&buf, count);
@@ -142,16 +159,17 @@ impl HardenedAllocator {
 
             // Try again after recycle
             if let Some(cached) = cache.pop(class_idx) {
-                let arena_idx = cached.arena_index as usize;
-                if arena_idx < self.num_arenas {
-                    self.arenas[arena_idx].setup_cached_alloc_metadata(
+                let cached_arena = cached.arena_index as usize;
+                if cached_arena < self.num_arenas {
+                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
                         cached.slab_ptr,
                         cached.slot_index,
                         cached.ptr,
                         size,
                         class_idx,
+                        align,
                     );
-                    return Some(cached.ptr);
+                    return Some(user_ptr);
                 }
             }
 
@@ -166,7 +184,6 @@ impl HardenedAllocator {
                 _pad2: 0,
             }; BATCH_SIZE];
 
-            let arena_idx = platform::splitmix64(tid as u64) as usize % self.num_arenas;
             let arena = &self.arenas[arena_idx];
             let n = arena.alloc_batch_raw(class_idx, &mut buf, BATCH_SIZE);
             if n == 0 {
@@ -177,19 +194,20 @@ impl HardenedAllocator {
             if first.arena_index as usize >= self.num_arenas {
                 return None;
             }
-            self.arenas[first.arena_index as usize].setup_cached_alloc_metadata(
+            let user_ptr = self.arenas[first.arena_index as usize].setup_cached_alloc_metadata(
                 first.slab_ptr,
                 first.slot_index,
                 first.ptr,
                 size,
                 class_idx,
+                align,
             );
 
             for i in 1..n {
                 cache.push(class_idx, buf[i]);
             }
-            Some(first.ptr)
-        })?
+            Some(user_ptr)
+        }, self.num_arenas)?
     }
 
     /// Free memory.
@@ -223,19 +241,46 @@ impl HardenedAllocator {
                     );
                 }
 
-                // Compute slot_size once for all checks below
+                // Compute slot_size once for all checks below.
+                // Compute slot_base inline to avoid redundant slot_size lookup
+                // inside slab.slot_base().
                 let slot_sz = crate::slab::size_class::slot_size(class_idx);
+                let slot_base = slab.data.add(slot_index * slot_sz);
+
+                // Always verify metadata integrity checksum
+                if !crate::hardening::integrity::verify_checksum(
+                    slot_base as usize,
+                    meta.requested_size,
+                    meta.flags,
+                    meta.checksum,
+                ) {
+                    crate::hardening::abort_with_message(
+                        "compatmalloc: metadata integrity check failed\n",
+                    );
+                }
 
                 #[cfg(feature = "canaries")]
                 {
-                    // Skip canary check when gap==0 (no canary was written)
-                    let gap = slot_sz - meta.requested_size as usize;
-                    if gap > 0
+                    let front_gap = ptr as usize - slot_base as usize;
+                    if front_gap > 0
+                        && !crate::hardening::canary::check_canary_front(
+                            slot_base,
+                            front_gap,
+                            meta.checksum,
+                        )
+                    {
+                        crate::hardening::abort_with_message(
+                            "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
+                        );
+                    }
+                    let effective_slot_sz = slot_sz - front_gap;
+                    let req_sz = meta.requested_size as usize;
+                    if req_sz < effective_slot_sz
                         && !crate::hardening::canary::check_canary(
                             ptr,
-                            meta.requested_size as usize,
-                            slot_sz,
-                            meta.canary,
+                            req_sz,
+                            effective_slot_sz,
+                            meta.checksum,
                         )
                     {
                         crate::hardening::abort_with_message(
@@ -247,24 +292,28 @@ impl HardenedAllocator {
                 // Mark freed eagerly for back-to-back double-free detection
                 meta.mark_freed();
 
-                // Poison/zero eagerly (security must not be deferred)
+                // Poison/zero eagerly using slot_base for full slot coverage
                 #[cfg(feature = "poison-on-free")]
                 {
-                    crate::hardening::poison::poison_region(ptr, slot_sz);
+                    crate::hardening::poison::poison_region(slot_base, slot_sz);
                 }
 
                 #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
                 {
-                    core::ptr::write_bytes(ptr, 0, meta.requested_size as usize);
+                    core::ptr::write_bytes(slot_base, 0, slot_sz);
                 }
 
-                // Mark ever_freed eagerly for calloc optimization
-                slab.ever_freed
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                // Mark ever_freed eagerly for calloc optimization.
+                // Check-before-store avoids cache line invalidation when already true
+                // (critical for multi-threaded performance).
+                if !slab.ever_freed.load(core::sync::atomic::Ordering::Relaxed) {
+                    slab.ever_freed
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
 
                 // Try to defer the actual bitmap/quarantine work via thread cache
                 if self.try_cache_free(
-                    ptr,
+                    slot_base,
                     info.slab_ptr,
                     slot_index,
                     class_idx,
@@ -298,11 +347,12 @@ impl HardenedAllocator {
 
     /// Try to defer a free to the thread-local free buffer.
     /// Security checks (canary, double-free) have already been done eagerly.
+    /// `slot_base` is the pre-computed base address (avoids redundant slot_size lookup).
     /// Returns true if the free was deferred (or flushed).
-    #[inline]
+    #[inline(always)]
     unsafe fn try_cache_free(
         &self,
-        ptr: *mut u8,
+        slot_base: *mut u8,
         slab_ptr: *mut u8,
         slot_index: usize,
         class_idx: usize,
@@ -311,7 +361,7 @@ impl HardenedAllocator {
         use crate::allocator::thread_cache::{self, CachedSlot};
 
         let cached = CachedSlot {
-            ptr,
+            ptr: slot_base,
             slab_ptr,
             slot_index: slot_index as u16,
             arena_index: arena_idx as u8,
@@ -345,28 +395,55 @@ impl HardenedAllocator {
         // Get old size from metadata (check per-slab, then large)
         let old_size = self.get_requested_size(ptr);
 
-        // If the new size fits in the same slot, just update metadata
-        if new_size <= old_size {
-            if let Some(old_class) = size_class_index(old_size) {
-                if let Some(new_class) = size_class_index(new_size) {
-                    if old_class == new_class {
-                        // Verify old canary before overwriting (skip if gap==0)
-                        #[cfg(feature = "canaries")]
-                        {
-                            if let Some(info) = page_map::lookup(ptr) {
-                                if !info.is_large() {
-                                    if let Some((slot_meta, _slot)) =
-                                        Arena::get_slot_meta_from_slab(info.slab_ptr, ptr)
+        // If the new size fits in the same size class, do in-place realloc.
+        // With right-aligned layout the user pointer may shift, so we copy
+        // within the slot if needed.
+        if let Some(old_class) = size_class_index(old_size) {
+            if let Some(new_class) = size_class_index(new_size) {
+                if old_class == new_class {
+                    if let Some(info) = page_map::lookup(ptr) {
+                        if !info.is_large() {
+                            let slab = &*(info.slab_ptr as *mut crate::slab::arena::Slab);
+                            if let Some(slot_idx) = slab.slot_for_ptr(ptr) {
+                                let slot_base = slab.slot_base(slot_idx);
+
+                                // Verify metadata integrity + canary before overwriting
+                                {
+                                    let slot_meta = slab.get_slot_meta(slot_idx);
+                                    if !crate::hardening::integrity::verify_checksum(
+                                        slot_base as usize,
+                                        slot_meta.requested_size,
+                                        slot_meta.flags,
+                                        slot_meta.checksum,
+                                    ) {
+                                        crate::hardening::abort_with_message(
+                                            "compatmalloc: metadata integrity check failed in realloc\n",
+                                        );
+                                    }
+
+                                    #[cfg(feature = "canaries")]
                                     {
-                                        let slot_sz =
-                                            crate::slab::size_class::slot_size(old_class);
-                                        let gap = slot_sz - slot_meta.requested_size as usize;
-                                        if gap > 0
+                                        let slot_sz = crate::slab::size_class::slot_size(old_class);
+                                        let front_gap = ptr as usize - slot_base as usize;
+                                        if front_gap > 0
+                                            && !crate::hardening::canary::check_canary_front(
+                                                slot_base,
+                                                front_gap,
+                                                slot_meta.checksum,
+                                            )
+                                        {
+                                            crate::hardening::abort_with_message(
+                                                "compatmalloc: heap buffer overflow detected (canary corrupted in realloc)\n",
+                                            );
+                                        }
+                                        let effective_slot_sz = slot_sz - front_gap;
+                                        let req_sz = slot_meta.requested_size as usize;
+                                        if req_sz < effective_slot_sz
                                             && !crate::hardening::canary::check_canary(
                                                 ptr,
-                                                slot_meta.requested_size as usize,
-                                                slot_sz,
-                                                slot_meta.canary,
+                                                req_sz,
+                                                effective_slot_sz,
+                                                slot_meta.checksum,
                                             )
                                         {
                                             crate::hardening::abort_with_message(
@@ -375,11 +452,28 @@ impl HardenedAllocator {
                                         }
                                     }
                                 }
+
+                                // Compute new user pointer and copy data within slot
+                                let arena_idx = info.arena_index as usize;
+                                if arena_idx < self.num_arenas {
+                                    let new_user_ptr = self.arenas[arena_idx]
+                                        .setup_cached_alloc_metadata(
+                                            info.slab_ptr,
+                                            slot_idx as u16,
+                                            slot_base,
+                                            new_size,
+                                            old_class,
+                                            MIN_ALIGN,
+                                        );
+                                    if new_user_ptr != ptr {
+                                        let copy_size = old_size.min(new_size);
+                                        // memmove-safe since src/dst may overlap
+                                        core::ptr::copy(ptr, new_user_ptr, copy_size);
+                                    }
+                                    return new_user_ptr;
+                                }
                             }
                         }
-                        // Update metadata in the correct slab
-                        self.update_metadata_for_realloc(ptr, new_size, old_class);
-                        return ptr;
                     }
                 }
             }
@@ -418,34 +512,6 @@ impl HardenedAllocator {
             }
         }
         self.usable_size(ptr)
-    }
-
-    /// Update metadata for in-place realloc (same size class).
-    /// Writes directly to per-slab metadata (no lock needed).
-    unsafe fn update_metadata_for_realloc(
-        &self,
-        ptr: *mut u8,
-        new_size: usize,
-        class_idx: usize,
-    ) {
-        if let Some(info) = page_map::lookup(ptr) {
-            if !info.is_large() {
-                if let Some((_slot_meta, slot)) =
-                    Arena::get_slot_meta_from_slab(info.slab_ptr, ptr)
-                {
-                    let arena_idx = info.arena_index as usize;
-                    if arena_idx < self.num_arenas {
-                        self.arenas[arena_idx].setup_cached_alloc_metadata(
-                            info.slab_ptr,
-                            slot as u16,
-                            ptr,
-                            new_size,
-                            class_idx,
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// Calloc: allocate zeroed memory.
@@ -487,6 +553,9 @@ impl HardenedAllocator {
     }
 
     /// Get usable size of an allocation.
+    /// When canaries are enabled, returns requested_size (not slot_size) because
+    /// the gap between requested_size and slot_size contains canary bytes that
+    /// must not be overwritten.
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> usize {
         if ptr.is_null() {
             return 0;
@@ -499,6 +568,16 @@ impl HardenedAllocator {
                     return sz;
                 }
             } else {
+                #[cfg(feature = "canaries")]
+                {
+                    // With canaries, the usable region is only the requested_size
+                    // because the gap contains canary bytes.
+                    if let Some((slot_meta, _slot)) =
+                        Arena::get_slot_meta_from_slab(info.slab_ptr, ptr)
+                    {
+                        return slot_meta.requested_size as usize;
+                    }
+                }
                 return crate::slab::size_class::slot_size(info.class_index as usize);
             }
         }
@@ -534,8 +613,9 @@ impl HardenedAllocator {
         // of alignment. This ensures all slots are naturally aligned since slab data
         // starts at a page-aligned boundary.
         if let Some(class_idx) = Self::find_aligned_size_class(alloc_size, alignment) {
-            // Use the regular allocation path with this class
-            if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx) {
+            // Use the regular allocation path with this class, passing alignment
+            // for correct right-aligned gap computation
+            if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx, alignment) {
                 return ptr;
             }
             let arena = self.select_arena();
@@ -564,6 +644,29 @@ impl HardenedAllocator {
             }
         }
         None
+    }
+
+    /// Reset all locks after fork. Only safe in single-threaded post-fork child.
+    ///
+    /// # Safety
+    /// Must only be called from atfork child handler when no other threads exist.
+    pub unsafe fn reset_locks_after_fork(&self) {
+        for i in 0..self.num_arenas {
+            self.arenas[i].reset_lock();
+        }
+        self.large.reset_lock();
+        self.large_metadata.reset_lock();
+    }
+
+    /// Scan all arenas and verify integrity of all allocated slots.
+    /// Returns an IntegrityResult with counts of errors found.
+    pub unsafe fn check_integrity(&self) -> crate::hardening::self_check::IntegrityResult {
+        let mut result = crate::hardening::self_check::IntegrityResult::default();
+        for i in 0..self.num_arenas {
+            let arena_result = self.arenas[i].check_integrity();
+            result.merge(&arena_result);
+        }
+        result
     }
 
     /// Find the smallest size class where slot_size >= size AND slot_size % alignment == 0.

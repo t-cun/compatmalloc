@@ -1,5 +1,5 @@
 use crate::platform;
-use crate::util::{align_up, PAGE_SIZE};
+use crate::util::{align_up, page_size};
 /// A large allocation: individual mmap region with optional guard pages.
 ///
 /// Layout: [guard page] [user data pages] [guard page]
@@ -22,10 +22,10 @@ impl LargeAlloc {
     /// Create a new large allocation.
     /// Returns None on failure.
     pub unsafe fn create(size: usize) -> Option<Self> {
-        let data_size = align_up(size, PAGE_SIZE);
+        let data_size = align_up(size, page_size());
 
         #[cfg(feature = "guard-pages")]
-        let total_size = PAGE_SIZE + data_size + PAGE_SIZE;
+        let total_size = page_size() + data_size + page_size();
         #[cfg(not(feature = "guard-pages"))]
         let total_size = data_size;
 
@@ -37,13 +37,13 @@ impl LargeAlloc {
         #[cfg(feature = "guard-pages")]
         {
             // Front guard page
-            platform::protect_none(base, PAGE_SIZE);
+            platform::protect_none(base, page_size());
             // Rear guard page
-            platform::protect_none(base.add(PAGE_SIZE + data_size), PAGE_SIZE);
+            platform::protect_none(base.add(page_size() + data_size), page_size());
         }
 
         #[cfg(feature = "guard-pages")]
-        let user_ptr = base.add(PAGE_SIZE);
+        let user_ptr = base.add(page_size());
         #[cfg(not(feature = "guard-pages"))]
         let user_ptr = base;
 

@@ -88,6 +88,39 @@ unsafe fn bootstrap_malloc(size: usize) -> *mut u8 {
     }
 }
 
+unsafe fn bootstrap_memalign(alignment: usize, size: usize) -> *mut u8 {
+    // We need at most (alignment - 1) extra bytes to find an aligned offset.
+    let extra = alignment - 1;
+    let total = match size.checked_add(extra) {
+        Some(t) => t,
+        None => return ptr::null_mut(),
+    };
+    let aligned_total = (total + 15) & !15;
+    // CAS loop to reserve space in the bootstrap buffer.
+    loop {
+        let offset = BOOTSTRAP_BUF_USED.load(Ordering::Relaxed);
+        if offset + aligned_total > BOOTSTRAP_BUF_SIZE {
+            return ptr::null_mut();
+        }
+        if BOOTSTRAP_BUF_USED
+            .compare_exchange_weak(
+                offset,
+                offset + aligned_total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let base = core::ptr::addr_of_mut!(BOOTSTRAP_BUF)
+                .cast::<u8>()
+                .add(offset);
+            // Align the pointer within the reserved region
+            let aligned = ((base as usize + alignment - 1) & !(alignment - 1)) as *mut u8;
+            return aligned;
+        }
+    }
+}
+
 unsafe fn is_bootstrap_ptr(ptr: *mut u8) -> bool {
     let base = core::ptr::addr_of!(BOOTSTRAP_BUF) as usize;
     let p = ptr as usize;
@@ -178,8 +211,8 @@ pub unsafe fn memalign(alignment: usize, size: usize) -> *mut u8 {
             ptr::null_mut()
         }
     } else {
-        // Bootstrap: just return aligned from bootstrap buffer
-        bootstrap_malloc(size + alignment)
+        // Bootstrap: return properly aligned pointer from bootstrap buffer
+        bootstrap_memalign(alignment, size)
     }
 }
 
