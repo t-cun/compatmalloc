@@ -11,5 +11,5 @@ build-dir = "book"
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/user/compatmalloc"
-edit-url-template = "https://github.com/user/compatmalloc/edit/main/docs/{path}"
+git-repository-url = "https://github.com/t-cun/compatmalloc"
+edit-url-template = "https://github.com/t-cun/compatmalloc/edit/main/docs/{path}"

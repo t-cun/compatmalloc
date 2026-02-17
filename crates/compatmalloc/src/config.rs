@@ -24,8 +24,7 @@ pub unsafe fn read_config() {
 /// # Safety
 /// Calls libc::getenv which is not thread-safe, so must be called during init.
 pub unsafe fn is_disabled() -> bool {
-    let key = b"COMPATMALLOC_DISABLE\0".as_ptr() as *const libc::c_char;
-    !libc::getenv(key).is_null()
+    !libc::getenv(c"COMPATMALLOC_DISABLE".as_ptr()).is_null()
 }
 
 pub fn arena_count() -> usize {
@@ -54,10 +53,12 @@ unsafe fn getenv_usize(key: &[u8]) -> Option<usize> {
         if byte == 0 {
             break;
         }
-        if byte < b'0' || byte > b'9' {
+        if !byte.is_ascii_digit() {
             return None; // Invalid
         }
-        result = result.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
+        result = result
+            .checked_mul(10)?
+            .checked_add((byte - b'0') as usize)?;
         ptr = ptr.add(1);
     }
     Some(result)

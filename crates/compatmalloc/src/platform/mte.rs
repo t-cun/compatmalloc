@@ -45,6 +45,9 @@ pub unsafe fn init() {
 }
 
 /// Stub for non-aarch64 targets.
+///
+/// # Safety
+/// No-op on non-aarch64 targets.
 #[cfg(not(target_arch = "aarch64"))]
 pub unsafe fn init() {}
 
@@ -72,6 +75,8 @@ pub unsafe fn tag_alloc(ptr: *mut u8) -> *mut u8 {
     tagged
 }
 
+/// # Safety
+/// `ptr` must be a valid pointer. No-op on non-aarch64.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 pub unsafe fn tag_alloc(ptr: *mut u8) -> *mut u8 {
@@ -98,6 +103,8 @@ pub unsafe fn tag_region(ptr: *mut u8, size: usize) {
     }
 }
 
+/// # Safety
+/// No-op on non-aarch64.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 pub unsafe fn tag_region(_ptr: *mut u8, _size: usize) {}
@@ -115,6 +122,8 @@ pub unsafe fn tag_freed(ptr: *mut u8, size: usize) {
     tag_region(new_tagged, size);
 }
 
+/// # Safety
+/// No-op on non-aarch64.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 pub unsafe fn tag_freed(_ptr: *mut u8, _size: usize) {}
@@ -141,6 +150,8 @@ pub unsafe fn map_anonymous_mte(size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// `size` must be page-aligned and non-zero.
 #[cfg(not(target_arch = "aarch64"))]
 pub unsafe fn map_anonymous_mte(size: usize) -> *mut u8 {
     crate::platform::map_anonymous(size)

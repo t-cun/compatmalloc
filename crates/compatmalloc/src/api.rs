@@ -30,6 +30,8 @@ macro_rules! dispatch {
 // Standard C allocator API
 // ============================================================================
 
+/// # Safety
+/// Standard C malloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     dispatch!(
@@ -38,6 +40,8 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     )
 }
 
+/// # Safety
+/// `ptr` must be null or previously returned by an allocation function.
 #[no_mangle]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
@@ -49,6 +53,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     );
 }
 
+/// # Safety
+/// `ptr` must be null or previously returned by an allocation function.
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     dispatch!(
@@ -57,6 +63,8 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     )
 }
 
+/// # Safety
+/// Standard C calloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
     dispatch!(
@@ -69,6 +77,8 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
 // POSIX alignment APIs
 // ============================================================================
 
+/// # Safety
+/// `memptr` must be a valid non-null pointer. Standard POSIX semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut c_void,
@@ -97,10 +107,12 @@ pub unsafe extern "C" fn posix_memalign(
     0
 }
 
+/// # Safety
+/// Standard C11 aligned_alloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
     // C11: size must be a multiple of alignment
-    if !alignment.is_power_of_two() || (size % alignment != 0 && size != 0) {
+    if !alignment.is_power_of_two() || (!size.is_multiple_of(alignment) && size != 0) {
         *libc::__errno_location() = libc::EINVAL;
         return ptr::null_mut();
     }
@@ -111,6 +123,8 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
     )
 }
 
+/// # Safety
+/// Standard memalign semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
     dispatch!(
@@ -119,6 +133,8 @@ pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void 
     )
 }
 
+/// # Safety
+/// Standard valloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     let ps = crate::util::page_size();
@@ -128,6 +144,8 @@ pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     )
 }
 
+/// # Safety
+/// Standard pvalloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
     let ps = crate::util::page_size();
@@ -142,6 +160,8 @@ pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
 // GNU extensions
 // ============================================================================
 
+/// # Safety
+/// `ptr` must be null or a valid allocation pointer.
 #[no_mangle]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
     if ptr.is_null() {
@@ -154,6 +174,9 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
 }
 
 /// mallopt: accept but ignore options for compatibility.
+///
+/// # Safety
+/// No special requirements; this is a no-op stub.
 #[no_mangle]
 pub unsafe extern "C" fn mallopt(_param: libc::c_int, _value: libc::c_int) -> libc::c_int {
     // Return 1 (success) but don't actually do anything
@@ -161,12 +184,18 @@ pub unsafe extern "C" fn mallopt(_param: libc::c_int, _value: libc::c_int) -> li
 }
 
 /// mallinfo: return zeroed struct for compatibility.
+///
+/// # Safety
+/// No special requirements; returns a zeroed struct.
 #[no_mangle]
 pub unsafe extern "C" fn mallinfo() -> libc::mallinfo {
     core::mem::zeroed()
 }
 
 /// mallinfo2: return zeroed struct for compatibility.
+///
+/// # Safety
+/// No special requirements; returns a zeroed struct.
 #[cfg(target_os = "linux")]
 #[no_mangle]
 pub unsafe extern "C" fn mallinfo2() -> libc::mallinfo2 {
@@ -179,6 +208,9 @@ pub unsafe extern "C" fn mallinfo2() -> libc::mallinfo2 {
 
 /// Scan all arenas and verify integrity of all allocated slots.
 /// Returns 0 on success, or the number of errors found on corruption.
+///
+/// # Safety
+/// Safe to call at any time; handles uninitialized state gracefully.
 #[no_mangle]
 pub unsafe extern "C" fn compatmalloc_check_integrity() -> libc::c_int {
     if init::state() != STATE_READY {

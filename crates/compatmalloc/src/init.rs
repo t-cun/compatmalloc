@@ -27,6 +27,8 @@ static CTOR: unsafe extern "C" fn() = {
     init
 };
 
+/// # Safety
+/// Must only be called during library initialization.
 pub unsafe fn compatmalloc_init() {
     match INIT_STATE.compare_exchange(UNINIT, INITIALIZING, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
@@ -85,12 +87,16 @@ pub unsafe fn compatmalloc_init() {
     INIT_STATE.store(READY, Ordering::Release);
 }
 
+/// # Safety
+/// Safe to call from any context; handles concurrent init.
 #[cold]
 #[inline(never)]
 pub unsafe fn ensure_initialized() {
     compatmalloc_init();
 }
 
+/// # Safety
+/// Must only be called after initialization is complete.
 #[inline(always)]
 pub unsafe fn allocator() -> &'static HardenedAllocator {
     &*ALLOCATOR.0.get()

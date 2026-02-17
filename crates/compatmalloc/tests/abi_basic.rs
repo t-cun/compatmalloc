@@ -168,7 +168,9 @@ fn calloc_zeroed_with_nmemb_and_size() {
 fn malloc_returns_16_byte_aligned_pointers() {
     unsafe {
         let a = alloc();
-        for &size in &[1usize, 2, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 100, 256, 1024, 4096] {
+        for &size in &[
+            1usize, 2, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 100, 256, 1024, 4096,
+        ] {
             let p = a.malloc(size);
             assert!(!p.is_null(), "malloc({}) returned NULL", size);
             assert_eq!(
@@ -191,7 +193,9 @@ fn malloc_returns_16_byte_aligned_pointers() {
 fn usable_size_at_least_requested() {
     unsafe {
         let a = alloc();
-        for &size in &[1usize, 7, 16, 17, 32, 100, 256, 512, 1024, 4096, 8192, 16384] {
+        for &size in &[
+            1usize, 7, 16, 17, 32, 100, 256, 512, 1024, 4096, 8192, 16384,
+        ] {
             let p = a.malloc(size);
             assert!(!p.is_null(), "malloc({}) returned NULL", size);
             let usable = a.usable_size(p);
@@ -216,9 +220,9 @@ fn various_allocation_sizes() {
     unsafe {
         let a = alloc();
         let sizes: Vec<usize> = vec![
-            1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 100, 128, 200, 255, 256,
-            257, 512, 1000, 1024, 2048, 4096, 8192, 10000, 16384, 32768, 65536, 131072, 262144,
-            524288, 1048576,
+            1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 100, 128, 200, 255, 256, 257,
+            512, 1000, 1024, 2048, 4096, 8192, 10000, 16384, 32768, 65536, 131072, 262144, 524288,
+            1048576,
         ];
 
         for &size in &sizes {

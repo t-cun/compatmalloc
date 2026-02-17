@@ -43,6 +43,7 @@ pub struct QuarantineRing {
 }
 
 impl QuarantineRing {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         QuarantineRing {
             entries: core::ptr::null_mut(),
@@ -61,10 +62,7 @@ impl QuarantineRing {
             return;
         }
         let cap = DEFAULT_QUARANTINE_SLOTS;
-        let bytes = align_up(
-            cap * core::mem::size_of::<QuarantineEntry>(),
-            page_size(),
-        );
+        let bytes = align_up(cap * core::mem::size_of::<QuarantineEntry>(), page_size());
         let mem = platform::map_anonymous(bytes);
         if mem.is_null() {
             return;
@@ -80,11 +78,11 @@ impl QuarantineRing {
     /// Push a freed pointer into quarantine with enriched slab info.
     /// Calls `recycle_fn` for each evicted entry so no entries are ever lost.
     /// All evicted entries belong to the same arena (by design of per-arena quarantine).
-    pub unsafe fn push_enriched<F>(
-        &mut self,
-        entry: QuarantineEntry,
-        mut recycle_fn: F,
-    ) where
+    ///
+    /// # Safety
+    /// `entry.ptr` must point to a valid freed slot. `entry.slab_ptr` must be valid.
+    pub unsafe fn push_enriched<F>(&mut self, entry: QuarantineEntry, mut recycle_fn: F)
+    where
         F: FnMut(&QuarantineEntry),
     {
         self.ensure_init();

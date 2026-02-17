@@ -5,7 +5,10 @@ fn main() {
     match target_os.as_str() {
         "linux" => {
             let script = format!("{}/linker/version_script.lds", manifest_dir);
-            println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={}", script);
+            println!(
+                "cargo:rustc-cdylib-link-arg=-Wl,--version-script={}",
+                script
+            );
             println!("cargo:rerun-if-changed=linker/version_script.lds");
         }
         "macos" => {

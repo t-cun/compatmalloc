@@ -20,7 +20,9 @@ unsafe impl Send for HardenedAllocator {}
 unsafe impl Sync for HardenedAllocator {}
 
 impl HardenedAllocator {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
         const ARENA: Arena = Arena::new();
         HardenedAllocator {
             arenas: [ARENA; MAX_ARENAS],
@@ -31,6 +33,9 @@ impl HardenedAllocator {
     }
 
     /// Initialize the allocator. Must be called before any allocations.
+    ///
+    /// # Safety
+    /// Must be called exactly once before any allocations are made.
     pub unsafe fn init(&mut self) -> bool {
         // Initialize the page map
         if !page_map::init() {
@@ -43,7 +48,7 @@ impl HardenedAllocator {
         self.num_arenas = if configured > 0 {
             configured.min(MAX_ARENAS)
         } else {
-            cpus.min(MAX_ARENAS).max(1)
+            cpus.clamp(1, MAX_ARENAS)
         };
 
         // Set arena indices (per-slab metadata needs no init)
@@ -84,6 +89,9 @@ impl HardenedAllocator {
     }
 
     /// Allocate memory.
+    ///
+    /// # Safety
+    /// Caller must ensure the allocator has been initialized.
     pub unsafe fn malloc(&self, size: usize) -> *mut u8 {
         // malloc(0) returns a unique non-NULL pointer
         let alloc_size = if size == 0 { 1 } else { size };
@@ -109,108 +117,119 @@ impl HardenedAllocator {
     /// then falls back to batch-fill from the arena.
     /// Uses consolidated TLS access (cache + tid + arena_idx) to avoid reentrant TLS.
     #[inline(always)]
-    unsafe fn try_cache_alloc(&self, size: usize, class_idx: usize, align: usize) -> Option<*mut u8> {
+    unsafe fn try_cache_alloc(
+        &self,
+        size: usize,
+        class_idx: usize,
+        align: usize,
+    ) -> Option<*mut u8> {
         use crate::allocator::thread_cache::{self, CachedSlot};
 
-        thread_cache::with_cache_tid_arena(|cache, _tid, arena_idx| {
-            // Fast path: pop from alloc cache
-            if let Some(cached) = cache.pop(class_idx) {
-                let cached_arena = cached.arena_index as usize;
-                if cached_arena < self.num_arenas {
-                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
-                        cached.slab_ptr,
-                        cached.slot_index,
-                        cached.ptr,
-                        size,
-                        class_idx,
-                        align,
-                    );
-                    return Some(user_ptr);
+        thread_cache::with_cache_tid_arena(
+            |cache, _tid, arena_idx| {
+                // Fast path: pop from alloc cache
+                if let Some(cached) = cache.pop(class_idx) {
+                    let cached_arena = cached.arena_index as usize;
+                    if cached_arena < self.num_arenas {
+                        let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
+                            cached.slab_ptr,
+                            cached.slot_index,
+                            cached.ptr,
+                            size,
+                            class_idx,
+                            align,
+                        );
+                        return Some(user_ptr);
+                    }
                 }
-            }
 
-            // Quick path: pop directly from free buffer (avoids recycle copy overhead
-            // in tight malloc/free loops where alloc cache is always empty)
-            if let Some(cached) = cache.pop_free(class_idx) {
-                let cached_arena = cached.arena_index as usize;
-                if cached_arena < self.num_arenas {
-                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
-                        cached.slab_ptr,
-                        cached.slot_index,
-                        cached.ptr,
-                        size,
-                        class_idx,
-                        align,
-                    );
-                    return Some(user_ptr);
+                // Quick path: pop directly from free buffer (avoids recycle copy overhead
+                // in tight malloc/free loops where alloc cache is always empty)
+                if let Some(cached) = cache.pop_free(class_idx) {
+                    let cached_arena = cached.arena_index as usize;
+                    if cached_arena < self.num_arenas {
+                        let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
+                            cached.slab_ptr,
+                            cached.slot_index,
+                            cached.ptr,
+                            size,
+                            class_idx,
+                            align,
+                        );
+                        return Some(user_ptr);
+                    }
                 }
-            }
 
-            // Full recycle: move remaining free buffer entries to alloc cache
-            let remaining = cache.recycle_frees(class_idx, 32);
+                // Full recycle: move remaining free buffer entries to alloc cache
+                let remaining = cache.recycle_frees(class_idx, 32);
 
-            // Flush oldest remaining entries to arena for quarantine (amortized)
-            if remaining > 0 {
-                let (buf, count) = cache.drain_frees(class_idx);
-                if count > 0 {
-                    self.arenas[arena_idx].free_batch_deferred(&buf, count);
+                // Flush oldest remaining entries to arena for quarantine (amortized)
+                if remaining > 0 {
+                    let (buf, count) = cache.drain_frees(class_idx);
+                    if count > 0 {
+                        self.arenas[arena_idx].free_batch_deferred(&buf, count);
+                    }
                 }
-            }
 
-            // Try again after recycle
-            if let Some(cached) = cache.pop(class_idx) {
-                let cached_arena = cached.arena_index as usize;
-                if cached_arena < self.num_arenas {
-                    let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
-                        cached.slab_ptr,
-                        cached.slot_index,
-                        cached.ptr,
-                        size,
-                        class_idx,
-                        align,
-                    );
-                    return Some(user_ptr);
+                // Try again after recycle
+                if let Some(cached) = cache.pop(class_idx) {
+                    let cached_arena = cached.arena_index as usize;
+                    if cached_arena < self.num_arenas {
+                        let user_ptr = self.arenas[cached_arena].setup_cached_alloc_metadata(
+                            cached.slab_ptr,
+                            cached.slot_index,
+                            cached.ptr,
+                            size,
+                            class_idx,
+                            align,
+                        );
+                        return Some(user_ptr);
+                    }
                 }
-            }
 
-            // Still empty: batch-fill from arena
-            const BATCH_SIZE: usize = 32;
-            let mut buf = [CachedSlot {
-                ptr: core::ptr::null_mut(),
-                slab_ptr: core::ptr::null_mut(),
-                slot_index: 0,
-                arena_index: 0,
-                _pad: 0,
-                _pad2: 0,
-            }; BATCH_SIZE];
+                // Still empty: batch-fill from arena
+                const BATCH_SIZE: usize = 32;
+                let mut buf = [CachedSlot {
+                    ptr: core::ptr::null_mut(),
+                    slab_ptr: core::ptr::null_mut(),
+                    slot_index: 0,
+                    arena_index: 0,
+                    _pad: 0,
+                    _pad2: 0,
+                }; BATCH_SIZE];
 
-            let arena = &self.arenas[arena_idx];
-            let n = arena.alloc_batch_raw(class_idx, &mut buf, BATCH_SIZE);
-            if n == 0 {
-                return None;
-            }
+                let arena = &self.arenas[arena_idx];
+                let n = arena.alloc_batch_raw(class_idx, &mut buf, BATCH_SIZE);
+                if n == 0 {
+                    return None;
+                }
 
-            let first = buf[0];
-            if first.arena_index as usize >= self.num_arenas {
-                return None;
-            }
-            let user_ptr = self.arenas[first.arena_index as usize].setup_cached_alloc_metadata(
-                first.slab_ptr,
-                first.slot_index,
-                first.ptr,
-                size,
-                class_idx,
-                align,
-            );
+                let first = buf[0];
+                if first.arena_index as usize >= self.num_arenas {
+                    return None;
+                }
+                let user_ptr = self.arenas[first.arena_index as usize].setup_cached_alloc_metadata(
+                    first.slab_ptr,
+                    first.slot_index,
+                    first.ptr,
+                    size,
+                    class_idx,
+                    align,
+                );
 
-            for i in 1..n {
-                cache.push(class_idx, buf[i]);
-            }
-            Some(user_ptr)
-        }, self.num_arenas)?
+                for item in buf.iter().take(n).skip(1) {
+                    cache.push(class_idx, *item);
+                }
+                Some(user_ptr)
+            },
+            self.num_arenas,
+        )?
     }
 
     /// Free memory.
+    ///
+    /// # Safety
+    /// `ptr` must be null or previously returned by this allocator and not yet freed.
     pub unsafe fn free(&self, ptr: *mut u8) {
         if ptr.is_null() {
             return;
@@ -236,9 +255,7 @@ impl HardenedAllocator {
                 let meta = slab.get_slot_meta_mut(slot_index);
 
                 if meta.is_freed() {
-                    crate::hardening::abort_with_message(
-                        "compatmalloc: double free detected\n",
-                    );
+                    crate::hardening::abort_with_message("compatmalloc: double free detected\n");
                 }
 
                 // Compute slot_size once for all checks below.
@@ -312,22 +329,12 @@ impl HardenedAllocator {
                 }
 
                 // Try to defer the actual bitmap/quarantine work via thread cache
-                if self.try_cache_free(
-                    slot_base,
-                    info.slab_ptr,
-                    slot_index,
-                    class_idx,
-                    arena_idx,
-                ) {
+                if self.try_cache_free(slot_base, info.slab_ptr, slot_index, class_idx, arena_idx) {
                     return;
                 }
 
                 // TLS not available: fall through to direct arena free (prechecked)
-                self.arenas[arena_idx].free_direct_prechecked(
-                    info.slab_ptr,
-                    ptr,
-                    slot_index,
-                );
+                self.arenas[arena_idx].free_direct_prechecked(info.slab_ptr, ptr, slot_index);
                 return;
             }
         }
@@ -382,6 +389,9 @@ impl HardenedAllocator {
     }
 
     /// Reallocate memory.
+    ///
+    /// # Safety
+    /// `ptr` must be null or previously returned by this allocator and not yet freed.
     pub unsafe fn realloc(&self, ptr: *mut u8, new_size: usize) -> *mut u8 {
         if ptr.is_null() {
             return self.malloc(new_size);
@@ -504,8 +514,7 @@ impl HardenedAllocator {
                 }
             } else {
                 // Read directly from per-slab metadata (no lock needed for read)
-                if let Some((slot_meta, _slot)) =
-                    Arena::get_slot_meta_from_slab(info.slab_ptr, ptr)
+                if let Some((slot_meta, _slot)) = Arena::get_slot_meta_from_slab(info.slab_ptr, ptr)
                 {
                     return slot_meta.requested_size as usize;
                 }
@@ -515,6 +524,9 @@ impl HardenedAllocator {
     }
 
     /// Calloc: allocate zeroed memory.
+    ///
+    /// # Safety
+    /// Caller must ensure the allocator has been initialized.
     pub unsafe fn calloc(&self, nmemb: usize, size: usize) -> *mut u8 {
         // Check for overflow
         let total = match nmemb.checked_mul(size) {
@@ -556,6 +568,9 @@ impl HardenedAllocator {
     /// When canaries are enabled, returns requested_size (not slot_size) because
     /// the gap between requested_size and slot_size contains canary bytes that
     /// must not be overwritten.
+    ///
+    /// # Safety
+    /// `ptr` must be null or a valid allocation pointer.
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> usize {
         if ptr.is_null() {
             return 0;
@@ -597,6 +612,9 @@ impl HardenedAllocator {
     }
 
     /// Aligned allocation.
+    ///
+    /// # Safety
+    /// Caller must ensure the allocator has been initialized.
     pub unsafe fn memalign(&self, alignment: usize, size: usize) -> *mut u8 {
         if !alignment.is_power_of_two() {
             return ptr::null_mut();
@@ -630,6 +648,9 @@ impl HardenedAllocator {
     }
 
     /// Get metadata for a pointer (for testing/debugging). Routes to correct arena or large.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid allocation pointer.
     pub unsafe fn get_metadata(
         &self,
         ptr: *mut u8,
@@ -660,6 +681,9 @@ impl HardenedAllocator {
 
     /// Scan all arenas and verify integrity of all allocated slots.
     /// Returns an IntegrityResult with counts of errors found.
+    ///
+    /// # Safety
+    /// Caller must ensure the allocator has been initialized.
     pub unsafe fn check_integrity(&self) -> crate::hardening::self_check::IntegrityResult {
         let mut result = crate::hardening::self_check::IntegrityResult::default();
         for i in 0..self.num_arenas {
@@ -671,9 +695,8 @@ impl HardenedAllocator {
 
     /// Find the smallest size class where slot_size >= size AND slot_size % alignment == 0.
     fn find_aligned_size_class(size: usize, alignment: usize) -> Option<usize> {
-        for i in 0..NUM_SIZE_CLASSES {
-            let ss = SIZE_CLASSES[i];
-            if ss >= size && ss % alignment == 0 {
+        for (i, &ss) in SIZE_CLASSES.iter().enumerate().take(NUM_SIZE_CLASSES) {
+            if ss >= size && ss.is_multiple_of(alignment) {
                 return Some(i);
             }
         }

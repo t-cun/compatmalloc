@@ -1,9 +1,9 @@
 pub mod guard;
 
 use crate::hardening::metadata::{AllocationMeta, MetadataTable};
+use crate::platform;
 use crate::slab::page_map;
 use crate::sync::RawMutex;
-use crate::platform;
 use core::cell::UnsafeCell;
 use core::ptr;
 use guard::LargeAlloc;
@@ -60,6 +60,7 @@ fn hash_large_ptr(key: usize) -> usize {
 }
 
 impl LargeAllocator {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         const EMPTY: LargeEntry = LargeEntry::empty();
         LargeAllocator {
@@ -72,10 +73,15 @@ impl LargeAllocator {
     }
 
     /// Reset the lock. Only safe in single-threaded post-fork child.
+    ///
+    /// # Safety
+    /// Must only be called from single-threaded post-fork child.
     pub unsafe fn reset_lock(&self) {
         self.lock.force_unlock();
     }
 
+    /// # Safety
+    /// Caller must ensure the allocator has been initialized.
     pub unsafe fn alloc(&self, size: usize, metadata: &MetadataTable) -> *mut u8 {
         let alloc = match LargeAlloc::create(size) {
             Some(a) => a,
@@ -118,6 +124,8 @@ impl LargeAllocator {
         user_ptr
     }
 
+    /// # Safety
+    /// `ptr` must be a valid large allocation pointer.
     pub unsafe fn free(&self, ptr: *mut u8, metadata: &MetadataTable) -> bool {
         // Check metadata BEFORE acquiring large lock to match alloc's lock order
         // (metadata lock -> large lock), preventing ABBA deadlock.
@@ -162,6 +170,8 @@ impl LargeAllocator {
         false
     }
 
+    /// # Safety
+    /// `ptr` must be a valid allocation pointer.
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
         self.lock.lock();
         let inner = &*self.inner.get();
@@ -170,6 +180,8 @@ impl LargeAllocator {
         result
     }
 
+    /// # Safety
+    /// `ptr` must be a valid pointer.
     pub unsafe fn contains(&self, ptr: *mut u8) -> bool {
         self.lock.lock();
         let inner = &*self.inner.get();
@@ -178,6 +190,8 @@ impl LargeAllocator {
         result
     }
 
+    /// # Safety
+    /// `ptr` must be a valid allocation pointer.
     pub unsafe fn requested_size(&self, ptr: *mut u8) -> Option<usize> {
         self.lock.lock();
         let inner = &*self.inner.get();

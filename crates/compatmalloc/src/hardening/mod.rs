@@ -1,6 +1,6 @@
-pub mod metadata;
 pub mod fork;
 pub mod integrity;
+pub mod metadata;
 pub mod self_check;
 
 // canary module is always compiled (integrity.rs uses canary::secret())

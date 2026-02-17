@@ -111,9 +111,7 @@ impl ClassCache {
     /// Drain all deferred frees into a buffer. Returns the count.
     fn drain_frees(&mut self, buf: &mut [CachedSlot; FREE_CACHE_SIZE]) -> usize {
         let count = self.free_count;
-        for i in 0..count {
-            buf[i] = self.free_slots[i];
-        }
+        buf[..count].copy_from_slice(&self.free_slots[..count]);
         self.free_count = 0;
         count
     }
@@ -128,7 +126,9 @@ impl ClassCache {
         if available == 0 {
             return 0;
         }
-        let to_recycle = available.min(max_recycle).min(CACHE_SIZE - self.alloc_count);
+        let to_recycle = available
+            .min(max_recycle)
+            .min(CACHE_SIZE - self.alloc_count);
         if to_recycle == 0 {
             return available;
         }
@@ -149,9 +149,7 @@ impl ClassCache {
             return 0;
         }
         let new_count = self.alloc_count - to_drain;
-        for i in 0..to_drain {
-            buf[i] = self.alloc_slots[new_count + i];
-        }
+        buf[..to_drain].copy_from_slice(&self.alloc_slots[new_count..new_count + to_drain]);
         self.alloc_count = new_count;
         to_drain
     }
@@ -163,6 +161,7 @@ pub struct ThreadCache {
 }
 
 impl ThreadCache {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         const EMPTY: ClassCache = ClassCache::new();
         ThreadCache {

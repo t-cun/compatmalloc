@@ -39,7 +39,11 @@ pub unsafe fn advise_free(ptr: *mut u8, size: usize) {
 pub fn num_cpus() -> usize {
     unsafe {
         let n = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
-        if n < 1 { 1 } else { n as usize }
+        if n < 1 {
+            1
+        } else {
+            n as usize
+        }
     }
 }
 

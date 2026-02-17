@@ -42,7 +42,7 @@ impl SlabBitmap {
 
     /// Number of u64 words needed for `num_slots` slots.
     pub const fn num_words_for(num_slots: usize) -> usize {
-        (num_slots + 63) / 64
+        num_slots.div_ceil(64)
     }
 
     /// Number of bytes needed for bitmap storage.
@@ -103,7 +103,9 @@ impl SlabBitmap {
             let slot = start_word * 64 + bit;
             if slot < self.num_slots {
                 unsafe {
-                    self.words.add(start_word).write(first_word & !(1u64 << bit));
+                    self.words
+                        .add(start_word)
+                        .write(first_word & !(1u64 << bit));
                 }
                 self.free_count -= 1;
                 return Some(slot);
@@ -143,7 +145,9 @@ impl SlabBitmap {
                 let slot = start_word * 64 + bit;
                 if slot < self.num_slots {
                     unsafe {
-                        self.words.add(start_word).write(first_word & !(1u64 << bit));
+                        self.words
+                            .add(start_word)
+                            .write(first_word & !(1u64 << bit));
                     }
                     self.free_count -= 1;
                     return Some(slot);
@@ -163,7 +167,11 @@ impl SlabBitmap {
         let word_idx = slot / 64;
         let bit_idx = slot % 64;
         let word = self.words.add(word_idx).read();
-        debug_assert!(word & (1u64 << bit_idx) == 0, "double free of slot {}", slot);
+        debug_assert!(
+            word & (1u64 << bit_idx) == 0,
+            "double free of slot {}",
+            slot
+        );
         self.words.add(word_idx).write(word | (1u64 << bit_idx));
         self.free_count += 1;
     }

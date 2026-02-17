@@ -9,10 +9,7 @@
 #[inline(always)]
 pub fn compute_checksum(slot_addr: usize, requested_size: u32, flags: u8) -> u64 {
     let secret = super::canary::secret();
-    let input = (slot_addr as u64)
-        ^ ((requested_size as u64) << 32)
-        ^ (flags as u64)
-        ^ secret;
+    let input = (slot_addr as u64) ^ ((requested_size as u64) << 32) ^ (flags as u64) ^ secret;
     // Single-round multiplicative hash: good avalanche, ~4 cycle latency
     let h = input.wrapping_mul(0xbf58476d1ce4e5b9);
     h ^ (h >> 31)

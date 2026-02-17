@@ -217,7 +217,12 @@ fn various_sizes_under_contention() {
                     for _ in 0..500 {
                         let size = SIZES[tid % SIZES.len()];
                         let p = a.malloc(size);
-                        assert!(!p.is_null(), "malloc({}) returned NULL in thread {}", size, tid);
+                        assert!(
+                            !p.is_null(),
+                            "malloc({}) returned NULL in thread {}",
+                            size,
+                            tid
+                        );
 
                         // Write and verify.
                         ptr::write_bytes(p, 0xEE, size);
@@ -299,8 +304,7 @@ fn hold_and_free_multiple_allocations() {
         .collect();
 
     for h in handles {
-        h.join()
-            .expect("thread panicked during hold-and-free test");
+        h.join().expect("thread panicked during hold-and-free test");
     }
 }
 

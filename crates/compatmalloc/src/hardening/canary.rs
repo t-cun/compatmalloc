@@ -6,6 +6,9 @@ static CANARY_SECRET: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the canary secret from a cryptographic source.
 /// Must be called once during allocator init.
+///
+/// # Safety
+/// Must be called from single-threaded context during init.
 pub unsafe fn init_canary_secret() {
     let mut buf = [0u8; 8];
     #[cfg(target_os = "linux")]

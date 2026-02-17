@@ -121,6 +121,7 @@ unsafe impl Send for PageMap {}
 unsafe impl Sync for PageMap {}
 
 impl PageMap {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         PageMap {
             l1: ptr::null_mut(),
@@ -129,6 +130,9 @@ impl PageMap {
     }
 
     /// Initialize the page map. Must be called once before use.
+    ///
+    /// # Safety
+    /// Must be called exactly once during allocator init.
     pub unsafe fn init(&mut self) -> bool {
         let l1_bytes = L1_SIZE * core::mem::size_of::<AtomicPtr<L2Block>>();
         let l1_bytes_aligned = crate::util::align_up(l1_bytes, page_size());
@@ -186,6 +190,9 @@ impl PageMap {
     }
 
     /// Register a range of pages as belonging to a slab.
+    ///
+    /// # Safety
+    /// `data_start` and `slab_ptr` must point to valid mapped memory.
     pub unsafe fn register_slab(
         &self,
         data_start: *mut u8,
@@ -198,7 +205,7 @@ impl PageMap {
             return;
         }
         let packed = pack_slab(slab_ptr, class_index as u8, arena_index as u8);
-        let num_pages = (data_size + page_size() - 1) / page_size();
+        let num_pages = data_size.div_ceil(page_size());
         for i in 0..num_pages {
             let page_addr = data_start.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
@@ -210,12 +217,15 @@ impl PageMap {
     }
 
     /// Register a large allocation's pages.
+    ///
+    /// # Safety
+    /// `user_ptr` must point to valid mapped memory of at least `data_size` bytes.
     pub unsafe fn register_large(&self, user_ptr: *mut u8, data_size: usize) {
         if !self.initialized.load(Ordering::Relaxed) {
             return;
         }
         let packed = pack_large();
-        let num_pages = (data_size + page_size() - 1) / page_size();
+        let num_pages = data_size.div_ceil(page_size());
         for i in 0..num_pages {
             let page_addr = user_ptr.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
@@ -227,11 +237,14 @@ impl PageMap {
     }
 
     /// Unregister a large allocation's pages.
+    ///
+    /// # Safety
+    /// `user_ptr` must be a previously registered large allocation.
     pub unsafe fn unregister_large(&self, user_ptr: *mut u8, data_size: usize) {
         if !self.initialized.load(Ordering::Relaxed) {
             return;
         }
-        let num_pages = (data_size + page_size() - 1) / page_size();
+        let num_pages = data_size.div_ceil(page_size());
         for i in 0..num_pages {
             let page_addr = user_ptr.add(i * page_size());
             let (l1_idx, l2_idx) = Self::indices(page_addr);
@@ -245,6 +258,9 @@ impl PageMap {
 
     /// Look up the page info for a pointer. Returns None if the page is not registered.
     /// The page map must be initialized before calling this (guaranteed by allocator init).
+    ///
+    /// # Safety
+    /// `ptr` must be a valid pointer (may be any address).
     #[inline(always)]
     pub unsafe fn lookup(&self, ptr: *mut u8) -> Option<PageInfo> {
         // Skip initialized check -- init() is called before any allocation.
@@ -270,11 +286,17 @@ unsafe impl Sync for PageMapHolder {}
 static PAGE_MAP: PageMapHolder = PageMapHolder(core::cell::UnsafeCell::new(PageMap::new()));
 
 /// Initialize the global page map.
+///
+/// # Safety
+/// Must be called exactly once during allocator init.
 pub unsafe fn init() -> bool {
     (*PAGE_MAP.0.get()).init()
 }
 
 /// Register slab pages in the global page map.
+///
+/// # Safety
+/// `data_start` and `slab_ptr` must point to valid mapped memory.
 pub unsafe fn register_slab(
     data_start: *mut u8,
     data_size: usize,
@@ -286,16 +308,25 @@ pub unsafe fn register_slab(
 }
 
 /// Register large allocation pages.
+///
+/// # Safety
+/// `user_ptr` must point to valid mapped memory of at least `data_size` bytes.
 pub unsafe fn register_large(user_ptr: *mut u8, data_size: usize) {
     (*PAGE_MAP.0.get()).register_large(user_ptr, data_size);
 }
 
 /// Unregister large allocation pages.
+///
+/// # Safety
+/// `user_ptr` must be a previously registered large allocation.
 pub unsafe fn unregister_large(user_ptr: *mut u8, data_size: usize) {
     (*PAGE_MAP.0.get()).unregister_large(user_ptr, data_size);
 }
 
 /// Look up page info for a pointer.
+///
+/// # Safety
+/// The page map must be initialized. `ptr` may be any address.
 #[inline(always)]
 pub unsafe fn lookup(ptr: *mut u8) -> Option<PageInfo> {
     (*PAGE_MAP.0.get()).lookup(ptr)

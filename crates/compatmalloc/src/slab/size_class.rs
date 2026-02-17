@@ -53,7 +53,7 @@ static LOOKUP_TABLE: [u8; LOOKUP_TABLE_SIZE] = {
     let mut i = 0;
     while i < LOOKUP_TABLE_SIZE {
         let size = (i + 1) * MIN_ALIGN; // size for this bucket
-        // Find smallest class >= size (binary search at compile time)
+                                        // Find smallest class >= size (binary search at compile time)
         let mut lo = 0usize;
         let mut hi = NUM_SIZE_CLASSES;
         while lo < hi {
@@ -83,7 +83,7 @@ pub fn size_class_index(size: usize) -> Option<usize> {
     }
 
     // O(1) lookup: (size + 15) / 16 - 1 maps to the correct bucket
-    let bucket = (size + MIN_ALIGN - 1) / MIN_ALIGN - 1;
+    let bucket = size.div_ceil(MIN_ALIGN) - 1;
     Some(LOOKUP_TABLE[bucket] as usize)
 }
 
@@ -102,7 +102,7 @@ pub static SLOT_MAGIC: [u64; NUM_SIZE_CLASSES] = {
     while i < NUM_SIZE_CLASSES {
         let d = SIZE_CLASSES[i] as u128;
         let two_64 = 1u128 << 64;
-        table[i] = ((two_64 + d - 1) / d) as u64;
+        table[i] = two_64.div_ceil(d) as u64;
         i += 1;
     }
     table
@@ -173,7 +173,13 @@ mod tests {
     #[test]
     fn all_classes_aligned() {
         for &sz in &SIZE_CLASSES {
-            assert_eq!(sz % MIN_ALIGN, 0, "class {} not aligned to {}", sz, MIN_ALIGN);
+            assert_eq!(
+                sz % MIN_ALIGN,
+                0,
+                "class {} not aligned to {}",
+                sz,
+                MIN_ALIGN
+            );
         }
     }
 
@@ -184,7 +190,11 @@ mod tests {
             for slot in 0..num_slots {
                 let offset = slot * sz;
                 let computed = fast_div_slot(offset, ci);
-                assert_eq!(computed, slot, "fast_div_slot({}, class={}) = {} expected {}", offset, ci, computed, slot);
+                assert_eq!(
+                    computed, slot,
+                    "fast_div_slot({}, class={}) = {} expected {}",
+                    offset, ci, computed, slot
+                );
             }
         }
     }

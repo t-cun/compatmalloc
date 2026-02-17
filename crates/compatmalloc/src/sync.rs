@@ -12,6 +12,7 @@ unsafe impl Send for RawMutex {}
 unsafe impl Sync for RawMutex {}
 
 impl RawMutex {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
             state: AtomicI32::new(0),

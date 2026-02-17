@@ -3,7 +3,6 @@
 /// Because our library exports `malloc`/`free` symbols, calling `libc::malloc`
 /// from within our library would recurse back to us. We must use dlsym(RTLD_NEXT)
 /// to find the real libc implementations.
-
 use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -24,35 +23,38 @@ static REAL_MALLOC_USABLE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Resolve real libc functions via dlsym(RTLD_NEXT, ...).
 /// Must be called once during init.
+///
+/// # Safety
+/// Must be called from single-threaded context during init.
 pub unsafe fn resolve_real_functions() {
     let rtld_next = -1isize as *mut c_void; // RTLD_NEXT
 
-    let m = libc::dlsym(rtld_next, b"malloc\0".as_ptr() as *const _);
+    let m = libc::dlsym(rtld_next, c"malloc".as_ptr());
     if !m.is_null() {
         REAL_MALLOC.store(m as usize, Ordering::Release);
     }
 
-    let f = libc::dlsym(rtld_next, b"free\0".as_ptr() as *const _);
+    let f = libc::dlsym(rtld_next, c"free".as_ptr());
     if !f.is_null() {
         REAL_FREE.store(f as usize, Ordering::Release);
     }
 
-    let r = libc::dlsym(rtld_next, b"realloc\0".as_ptr() as *const _);
+    let r = libc::dlsym(rtld_next, c"realloc".as_ptr());
     if !r.is_null() {
         REAL_REALLOC.store(r as usize, Ordering::Release);
     }
 
-    let c = libc::dlsym(rtld_next, b"calloc\0".as_ptr() as *const _);
+    let c = libc::dlsym(rtld_next, c"calloc".as_ptr());
     if !c.is_null() {
         REAL_CALLOC.store(c as usize, Ordering::Release);
     }
 
-    let pm = libc::dlsym(rtld_next, b"posix_memalign\0".as_ptr() as *const _);
+    let pm = libc::dlsym(rtld_next, c"posix_memalign".as_ptr());
     if !pm.is_null() {
         REAL_POSIX_MEMALIGN.store(pm as usize, Ordering::Release);
     }
 
-    let mu = libc::dlsym(rtld_next, b"malloc_usable_size\0".as_ptr() as *const _);
+    let mu = libc::dlsym(rtld_next, c"malloc_usable_size".as_ptr());
     if !mu.is_null() {
         REAL_MALLOC_USABLE_SIZE.store(mu as usize, Ordering::Release);
     }
@@ -124,9 +126,11 @@ unsafe fn bootstrap_memalign(alignment: usize, size: usize) -> *mut u8 {
 unsafe fn is_bootstrap_ptr(ptr: *mut u8) -> bool {
     let base = core::ptr::addr_of!(BOOTSTRAP_BUF) as usize;
     let p = ptr as usize;
-    p >= base && p < base + BOOTSTRAP_BUF_SIZE
+    (base..base + BOOTSTRAP_BUF_SIZE).contains(&p)
 }
 
+/// # Safety
+/// Caller must ensure `size` is valid.
 #[inline]
 pub unsafe fn malloc(size: usize) -> *mut u8 {
     let f = REAL_MALLOC.load(Ordering::Acquire);
@@ -138,6 +142,8 @@ pub unsafe fn malloc(size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// `ptr` must be null or a valid allocation pointer.
 #[inline]
 pub unsafe fn free(ptr: *mut u8) {
     if ptr.is_null() || is_bootstrap_ptr(ptr) {
@@ -150,6 +156,8 @@ pub unsafe fn free(ptr: *mut u8) {
     }
 }
 
+/// # Safety
+/// `ptr` must be null or a valid allocation pointer.
 #[inline]
 pub unsafe fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     if ptr.is_null() {
@@ -178,6 +186,8 @@ pub unsafe fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// Caller must ensure `nmemb` and `size` are valid.
 #[inline]
 pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut u8 {
     let f = REAL_CALLOC.load(Ordering::Acquire);
@@ -198,6 +208,8 @@ pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// `alignment` must be a power of two.
 #[inline]
 pub unsafe fn memalign(alignment: usize, size: usize) -> *mut u8 {
     let f = REAL_POSIX_MEMALIGN.load(Ordering::Acquire);
@@ -216,6 +228,8 @@ pub unsafe fn memalign(alignment: usize, size: usize) -> *mut u8 {
     }
 }
 
+/// # Safety
+/// `ptr` must be a valid allocation pointer.
 #[inline]
 pub unsafe fn malloc_usable_size(ptr: *mut u8) -> usize {
     let f = REAL_MALLOC_USABLE_SIZE.load(Ordering::Acquire);

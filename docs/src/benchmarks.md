@@ -2,6 +2,8 @@
 
 compatmalloc prioritizes security over raw performance. This page describes the performance characteristics, overhead sources, and how to run benchmarks to measure the impact on your workloads.
 
+{{#include generated/benchmark-results.md}}
+
 ## Performance characteristics
 
 ### Expected overhead
@@ -30,36 +32,41 @@ With the default arena count (one per CPU), contention is low for most workloads
 
 ## Running benchmarks
 
-### Basic benchmark run
+### Microbenchmark suite
+
+The benchmark suite is a standalone binary that measures allocator performance via `LD_PRELOAD`:
 
 ```bash
-cargo bench --workspace
+# Build the library and benchmark
+cargo build --release
+rustc -O benches/src/micro.rs -o target/release/micro
+
+# Run with glibc (baseline)
+ALLOCATOR_NAME=glibc ./target/release/micro
+
+# Run with compatmalloc
+ALLOCATOR_NAME=compatmalloc \
+  LD_PRELOAD=./target/release/libcompatmalloc.so \
+  ./target/release/micro
 ```
 
-This runs all benchmarks defined in the `benches/` directory and outputs timing results to the console. Results are also saved under `target/criterion/` if Criterion is used.
+### Full comparison script
 
-### Comparing against baseline
-
-To compare the current build against a baseline:
+To compare against multiple allocators (glibc, jemalloc, mimalloc, scudo):
 
 ```bash
-# Save a baseline
-cargo bench --workspace -- --save-baseline main
-
-# Make changes, then compare
-cargo bench --workspace -- --baseline main
+./benches/scripts/run_comparison.sh
 ```
 
 ### Disabling hardening for comparison
 
-To measure the overhead of hardening features, compare against a build with no features:
+To measure the overhead of hardening features, build with no features:
 
 ```bash
-# With all hardening (default)
-cargo bench --workspace
-
-# Without hardening
-cargo bench --workspace --no-default-features
+cargo build --release --no-default-features
+ALLOCATOR_NAME=minimal \
+  LD_PRELOAD=./target/release/libcompatmalloc.so \
+  ./target/release/micro
 ```
 
 ### LD_PRELOAD benchmarks with external programs

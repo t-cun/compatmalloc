@@ -55,6 +55,7 @@ pub struct MetadataInner {
 }
 
 impl MetadataInner {
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         MetadataInner {
             entries: ptr::null_mut(),
@@ -80,6 +81,7 @@ unsafe impl Sync for MetadataTable {}
 impl MetadataTable {
     const INITIAL_CAPACITY: usize = 16384;
 
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         MetadataTable {
             lock: RawMutex::new(),
@@ -88,11 +90,17 @@ impl MetadataTable {
     }
 
     /// Reset the lock. Only safe in single-threaded post-fork child.
+    ///
+    /// # Safety
+    /// Must only be called from single-threaded post-fork child.
     pub unsafe fn reset_lock(&self) {
         self.lock.force_unlock();
     }
 
     /// Initialize the metadata table (must be called before use).
+    ///
+    /// # Safety
+    /// Must be called exactly once during allocator init.
     pub unsafe fn init(&self) -> bool {
         let inner = &mut *self.inner.get();
         Self::init_inner(inner, Self::INITIAL_CAPACITY)
@@ -115,6 +123,8 @@ impl MetadataTable {
     // Locked methods (for standalone use, e.g. large allocator metadata)
     // ========================================================================
 
+    /// # Safety
+    /// `ptr` must be a valid non-null allocation pointer.
     pub unsafe fn insert(&self, ptr: *mut u8, meta: AllocationMeta) {
         self.lock.lock();
         let inner = &mut *self.inner.get();
@@ -122,6 +132,8 @@ impl MetadataTable {
         self.lock.unlock();
     }
 
+    /// # Safety
+    /// `ptr` must be a valid pointer.
     pub unsafe fn get(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         self.lock.lock();
         let inner = &*self.inner.get();
@@ -130,6 +142,8 @@ impl MetadataTable {
         result
     }
 
+    /// # Safety
+    /// `ptr` must be a valid allocation pointer.
     pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         self.lock.lock();
         let inner = &*self.inner.get();
@@ -138,6 +152,8 @@ impl MetadataTable {
         result
     }
 
+    /// # Safety
+    /// `ptr` must be a valid pointer.
     pub unsafe fn remove(&self, ptr: *mut u8) {
         self.lock.lock();
         let inner = &mut *self.inner.get();
@@ -169,7 +185,10 @@ impl MetadataTable {
 
     #[inline]
     #[allow(dead_code)]
-    pub(crate) unsafe fn get_and_mark_freed_unlocked(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+    pub(crate) unsafe fn get_and_mark_freed_unlocked(
+        &self,
+        ptr: *mut u8,
+    ) -> Option<AllocationMeta> {
         let inner = &*self.inner.get();
         Self::get_and_mark_freed_inner(inner, ptr)
     }
@@ -303,7 +322,10 @@ impl MetadataTable {
     /// then rehashes entries.
     unsafe fn grow(inner: &mut MetadataInner) {
         let new_capacity = inner.capacity * 2;
-        let new_size = align_up(new_capacity * core::mem::size_of::<MetaEntry>(), page_size());
+        let new_size = align_up(
+            new_capacity * core::mem::size_of::<MetaEntry>(),
+            page_size(),
+        );
         let new_mem = platform::map_anonymous(new_size);
         if new_mem.is_null() {
             return;

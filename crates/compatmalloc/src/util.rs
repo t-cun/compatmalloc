@@ -73,7 +73,9 @@ pub const DEFAULT_QUARANTINE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 /// E.g., 128 -> 128, 96 -> 32, 48 -> 16.
 #[inline(always)]
 pub const fn largest_pow2_dividing(x: usize) -> usize {
-    if x == 0 { return 1; }
+    if x == 0 {
+        return 1;
+    }
     x & x.wrapping_neg()
 }
 

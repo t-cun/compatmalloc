@@ -21,6 +21,9 @@ pub struct LargeAlloc {
 impl LargeAlloc {
     /// Create a new large allocation.
     /// Returns None on failure.
+    ///
+    /// # Safety
+    /// Caller must ensure `size` is non-zero.
     pub unsafe fn create(size: usize) -> Option<Self> {
         let data_size = align_up(size, page_size());
 
@@ -57,6 +60,9 @@ impl LargeAlloc {
     }
 
     /// Destroy this large allocation, unmapping all memory.
+    ///
+    /// # Safety
+    /// Must only be called once; memory must not be accessed after this call.
     pub unsafe fn destroy(&self) {
         platform::unmap(self.base, self.total_size);
     }

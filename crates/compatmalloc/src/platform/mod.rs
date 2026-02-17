@@ -79,7 +79,7 @@ pub fn fast_random_u64() -> u64 {
     use core::cell::Cell;
 
     thread_local! {
-        static RNG_STATE: Cell<u64> = Cell::new(0);
+        static RNG_STATE: Cell<u64> = const { Cell::new(0) };
     }
 
     // Try thread-local fast path
@@ -105,8 +105,7 @@ pub fn fast_random_u64() -> u64 {
         Ok(val) => val,
         Err(_) => {
             // TLS not available (early init or thread destruction) -- fallback
-            static COUNTER: core::sync::atomic::AtomicU64 =
-                core::sync::atomic::AtomicU64::new(0);
+            static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             splitmix64(count.wrapping_add(0x9E3779B97F4A7C15))
         }
