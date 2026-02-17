@@ -705,6 +705,7 @@ impl Arena {
         false
     }
 
+    #[allow(unused_variables)]
     unsafe fn free_from_slab(inner: &mut ArenaInner, slab: &mut Slab, ptr: *mut u8) -> bool {
         let slot_idx = match slab.slot_for_ptr(ptr) {
             Some(s) => s,
@@ -915,6 +916,7 @@ impl Arena {
                 let slab = &*slab_ptr;
                 result.total_slabs += 1;
 
+                #[allow(unused_variables)]
                 let slot_sz = size_class::slot_size(slab.class_index);
                 let num_slots = size_class::slots_per_slab(slab.class_index);
 
