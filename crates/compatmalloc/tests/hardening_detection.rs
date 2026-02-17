@@ -103,6 +103,10 @@ fn scenario_double_free() {
 /// With right-aligned layout, canaries exist in both the front gap [slot_base..user_ptr)
 /// and the back gap [user_ptr+requested_size..slot_end). For most small allocations
 /// with MIN_ALIGN=16, the front gap is 0 and the back gap contains the canary bytes.
+///
+/// With deferred verification, the canary check happens at batch flush time (when
+/// the free buffer fills up), not at the individual free() call. We trigger the
+/// flush by freeing enough entries to fill the per-size-class free buffer (64 slots).
 fn scenario_canary_corruption() {
     unsafe {
         let a = alloc();
@@ -111,12 +115,25 @@ fn scenario_canary_corruption() {
         let p = a.malloc(requested);
         assert!(!p.is_null());
 
+        // Pre-allocate enough slots to fill the free buffer and trigger a flush.
+        let mut extras = [ptr::null_mut(); 64];
+        for slot in extras.iter_mut() {
+            *slot = a.malloc(requested);
+            assert!(!slot.is_null());
+        }
+
         // Corrupt the back-gap canary by writing one byte past the requested size.
         let after = p.add(requested);
         after.write(0x00);
 
-        // Freeing should detect the corrupted canary and abort.
+        // Free the corrupted pointer (deferred to batch flush).
         a.free(p);
+
+        // Free extras to fill the buffer and trigger verified batch flush.
+        // The flush will detect the canary corruption and abort.
+        for &q in &extras {
+            a.free(q);
+        }
     }
     unreachable!("canary corruption was not detected");
 }
@@ -162,15 +179,27 @@ fn freed_memory_is_poisoned() {
         let p = a.malloc(size);
         assert!(!p.is_null());
 
+        // Pre-allocate enough slots to fill the free buffer and trigger a flush.
+        let mut extras = [ptr::null_mut(); 64];
+        for slot in extras.iter_mut() {
+            *slot = a.malloc(size);
+            assert!(!slot.is_null());
+        }
+
         // Fill with a known pattern (not 0xFE) to ensure we see the change.
         ptr::write_bytes(p, 0xAA, size);
 
-        // Free it -- the allocator should poison the memory.
+        // Free p (deferred: poison happens at batch flush, not here).
         a.free(p);
 
-        // Read back. The allocator zeros first then poisons the full slot_size.
-        // Since poison is applied last, the bytes should always be 0xFE when
-        // poison-on-free is enabled, regardless of zero-on-free.
+        // Free extras to fill the buffer and trigger verified batch flush.
+        // The flush poisons all deferred entries including p.
+        for &q in &extras {
+            a.free(q);
+        }
+
+        // After flush, p should be poisoned. The memory remains mapped
+        // (slab pages are never unmapped), so reading it is safe.
         let slice = std::slice::from_raw_parts(p, size);
 
         assert!(
@@ -209,10 +238,24 @@ fn freed_memory_poison_full_slot() {
             requested
         );
 
+        // Pre-allocate enough slots to fill the free buffer and trigger a flush.
+        let mut extras = [ptr::null_mut(); 64];
+        for slot in extras.iter_mut() {
+            *slot = a.malloc(requested);
+            assert!(!slot.is_null());
+        }
+
         ptr::write_bytes(p, 0xAA, slot_size);
+
+        // Free p (deferred: poison happens at batch flush).
         a.free(p);
 
-        // The entire slot should be poisoned.
+        // Free extras to fill the buffer and trigger verified batch flush.
+        for &q in &extras {
+            a.free(q);
+        }
+
+        // After flush, the entire slot should be poisoned.
         let slice = std::slice::from_raw_parts(p, slot_size);
         assert!(
             slice.iter().all(|&b| b == POISON),

@@ -97,7 +97,7 @@ impl QuarantineRing {
         // Evict oldest entries until we have space
         while self.total_bytes + entry.size > self.max_bytes && self.count > 0 {
             let old = *self.entries.add(self.head);
-            self.head = (self.head + 1) % cap;
+            self.head = (self.head + 1) & (cap - 1);
             self.count -= 1;
             self.total_bytes -= old.size;
             recycle_fn(&old);
@@ -106,7 +106,7 @@ impl QuarantineRing {
         // Also evict if ring buffer is full by count
         if self.count >= cap {
             let old = *self.entries.add(self.head);
-            self.head = (self.head + 1) % cap;
+            self.head = (self.head + 1) & (cap - 1);
             self.count -= 1;
             self.total_bytes -= old.size;
             recycle_fn(&old);
@@ -114,7 +114,7 @@ impl QuarantineRing {
 
         // Push new entry
         *self.entries.add(self.tail) = entry;
-        self.tail = (self.tail + 1) % cap;
+        self.tail = (self.tail + 1) & (cap - 1);
         self.count += 1;
         self.total_bytes += entry.size;
     }

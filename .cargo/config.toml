@@ -1,0 +1,7 @@
+[target.x86_64-unknown-linux-gnu]
+# Cross-language LTO: use clang-21 as linker driver with lld-21 backend.
+# LLVM 21.1.8 matches rustc's LLVM version exactly.
+# This lets LLVM optimize across Rust and C boundaries, inlining
+# the C TLS shim directly into Rust hot paths.
+linker = "clang-21"
+rustflags = ["-Clinker-plugin-lto", "-Clink-arg=-fuse-ld=lld-21"]

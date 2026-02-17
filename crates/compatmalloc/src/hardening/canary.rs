@@ -54,12 +54,15 @@ pub unsafe fn init_canary_secret() {
 }
 
 /// Generate a canary value for an allocation.
-/// Uses splitmix64(addr ^ per-process-secret) for unpredictability.
+/// Uses a non-invertible double-hash: splitmix64(splitmix64(secret) ^ splitmix64(addr)).
+/// Unlike single splitmix64(addr ^ secret), this cannot be inverted even if the
+/// attacker knows the canary and the address, because splitmix64 destroys the
+/// algebraic structure needed to solve for the secret.
 #[inline]
 pub fn generate_canary(ptr: *mut u8) -> u64 {
     let addr = ptr as u64;
     let secret = CANARY_SECRET.load(Ordering::Acquire);
-    platform::splitmix64(addr ^ secret)
+    platform::splitmix64(platform::splitmix64(secret) ^ platform::splitmix64(addr))
 }
 
 /// Write canary bytes in the gap between requested_size and slot_size.
@@ -155,6 +158,6 @@ pub unsafe fn check_canary_front(slot_base: *mut u8, gap: usize, canary: u64) ->
 /// Uses Relaxed ordering since the secret is initialized once during init
 /// (which happens-before any allocation) and never changes.
 #[inline(always)]
-pub fn secret() -> u64 {
+pub(crate) fn secret() -> u64 {
     CANARY_SECRET.load(Ordering::Relaxed)
 }

@@ -25,7 +25,9 @@ pub const MIN_ALIGN: usize = 16;
 
 /// Runtime page size, initialized from sysconf(_SC_PAGESIZE) at startup.
 /// Falls back to 4096 if not yet initialized.
-static PAGE_SIZE_CACHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Initialize to 4096 (the universal default) to eliminate the branch in page_size().
+/// After init_page_size() runs, this holds the real value from sysconf.
+static PAGE_SIZE_CACHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(4096);
 
 /// Cached log2(page_size) for fast division-free page number computation.
 /// Avoids ~35-cycle hardware `div` on every page_map lookup.
@@ -42,16 +44,11 @@ pub unsafe fn init_page_size() {
     PAGE_SHIFT_CACHED.store(ps.trailing_zeros(), core::sync::atomic::Ordering::Release);
 }
 
-/// Get the system page size. Returns the cached value after init,
-/// or 4096 as a safe default before init.
+/// Get the system page size. Always returns a valid value (4096 default, real value after init).
+/// Branchless: PAGE_SIZE_CACHED is initialized to 4096 so it's never zero.
 #[inline(always)]
 pub fn page_size() -> usize {
-    let cached = PAGE_SIZE_CACHED.load(core::sync::atomic::Ordering::Relaxed);
-    if cached != 0 {
-        cached
-    } else {
-        4096
-    }
+    PAGE_SIZE_CACHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Get log2(page_size) for shift-based division. Returns 12 (for 4096) before init.

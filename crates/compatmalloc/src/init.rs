@@ -81,6 +81,11 @@ pub unsafe fn compatmalloc_init() {
         return;
     }
 
+    // Initialize pthread-based TLS for fast thread cache access.
+    // Must happen after allocator init (uses passthrough for any internal allocs)
+    // but before READY (so hot path can use it).
+    crate::allocator::thread_cache::init_tls();
+
     // Register fork safety handlers
     crate::hardening::fork::register_atfork();
 

@@ -12,12 +12,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Per-slot metadata stored inline in the slab header.
 /// Eliminates all hashing, locking, and backward-shift deletion from the hot path.
 /// Field order optimized: u64 first to avoid alignment padding (16 bytes vs 24).
-#[derive(Clone, Copy)]
+///
+/// The `flags` field uses AtomicU8 for race-free double-free detection via CAS.
+/// All other fields are non-atomic (protected by bitmap ownership invariant).
 #[repr(C)]
 pub struct SlotMeta {
     pub checksum: u64,
     pub requested_size: u32,
-    pub flags: u8,
+    pub flags: core::sync::atomic::AtomicU8,
     _pad: [u8; 3],
 }
 
@@ -28,26 +30,43 @@ impl SlotMeta {
         SlotMeta {
             requested_size: 0,
             checksum: 0,
-            flags: 0,
+            flags: core::sync::atomic::AtomicU8::new(0),
             _pad: [0; 3],
         }
     }
 
+    /// Atomically check if this slot is marked as freed.
     #[inline(always)]
     pub fn is_freed(&self) -> bool {
-        self.flags & SLOT_META_FLAG_FREED != 0
+        self.flags.load(core::sync::atomic::Ordering::Relaxed) & SLOT_META_FLAG_FREED != 0
+    }
+
+    /// Atomically mark this slot as freed using CAS.
+    /// Returns true if we successfully transitioned from live to freed.
+    /// Returns false if already freed (double-free detected).
+    #[inline(always)]
+    pub fn try_mark_freed(&self) -> bool {
+        let old = self.flags.fetch_or(SLOT_META_FLAG_FREED, core::sync::atomic::Ordering::AcqRel);
+        old & SLOT_META_FLAG_FREED == 0
     }
 
     #[inline(always)]
-    pub fn mark_freed(&mut self) {
-        self.flags |= SLOT_META_FLAG_FREED;
+    pub fn clear(&self) {
+        self.checksum_store(0);
+        self.requested_size_store(0);
+        self.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Non-atomic write helpers — safe because bitmap ownership prevents concurrent access
+    /// to the same slot's non-flag fields.
+    #[inline(always)]
+    pub fn checksum_store(&self, val: u64) {
+        unsafe { ((&self.checksum) as *const u64 as *mut u64).write(val) };
     }
 
     #[inline(always)]
-    pub fn clear(&mut self) {
-        self.checksum = 0;
-        self.requested_size = 0;
-        self.flags = 0;
+    pub fn requested_size_store(&self, val: u32) {
+        unsafe { ((&self.requested_size) as *const u32 as *mut u32).write(val) };
     }
 }
 
@@ -221,14 +240,16 @@ impl Slab {
         &*self.meta.add(slot)
     }
 
-    /// Get mutable per-slot metadata for a given slot index.
+    /// Get per-slot metadata for a given slot index (mutable-like access).
+    /// Since SlotMeta uses interior mutability (AtomicU8 for flags, unsafe writes
+    /// for other fields protected by bitmap ownership), &self suffices.
     ///
     /// # Safety
-    /// Caller must ensure exclusive access to the slot's metadata.
+    /// `slot` must be a valid slot index within this slab.
+    /// Non-atomic fields must only be written when the bitmap guarantees exclusive access.
     #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn get_slot_meta_mut(&self, slot: usize) -> &mut SlotMeta {
-        &mut *self.meta.add(slot)
+    pub unsafe fn get_slot_meta_ref(&self, slot: usize) -> &SlotMeta {
+        &*self.meta.add(slot)
     }
 }
 
@@ -346,18 +367,18 @@ impl Arena {
     }
 
     /// Get slot metadata using slab pointer + slot index (lock-free read).
-    /// Used by hardened.rs for realloc and other metadata lookups.
+    /// Returns (requested_size, slot_index). Used by hardened.rs for realloc.
     ///
     /// # Safety
     /// `slab_raw` must point to a valid Slab, `ptr` must be within its data region.
     pub unsafe fn get_slot_meta_from_slab(
         slab_raw: *mut u8,
         ptr: *mut u8,
-    ) -> Option<(SlotMeta, usize)> {
+    ) -> Option<(u32, usize)> {
         let slab = &*(slab_raw as *mut Slab);
         if let Some(slot) = slab.slot_for_ptr(ptr) {
-            let meta = *slab.get_slot_meta(slot);
-            Some((meta, slot))
+            let meta = slab.get_slot_meta(slot);
+            Some((meta.requested_size, slot))
         } else {
             None
         }
@@ -416,19 +437,20 @@ impl Arena {
         let user_ptr = slab.slot_user_ptr(slot, size, crate::util::MIN_ALIGN);
 
         // Write metadata directly to per-slab array (no hash, no lock)
-        let meta = slab.get_slot_meta_mut(slot);
+        let meta = slab.get_slot_meta(slot);
 
-        meta.requested_size = size as u32;
-        meta.flags = 0;
+        meta.requested_size_store(size as u32);
+        meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
 
         let slot_base = slab.slot_base(slot);
 
         // Always compute metadata integrity checksum
-        meta.checksum = crate::hardening::integrity::compute_checksum(
+        let checksum = crate::hardening::integrity::compute_checksum(
             slot_base as usize,
-            meta.requested_size,
-            meta.flags,
+            size as u32,
+            0,
         );
+        meta.checksum_store(checksum);
 
         // Use checksum value as canary for gap fill
         #[cfg(feature = "canaries")]
@@ -436,7 +458,7 @@ impl Arena {
             let slot_sz = size_class::slot_size(slab.class_index);
             let front_gap = user_ptr as usize - slot_base as usize;
             if front_gap > 0 {
-                crate::hardening::canary::write_canary_front(slot_base, front_gap, meta.checksum);
+                crate::hardening::canary::write_canary_front(slot_base, front_gap, checksum);
             }
             let effective_slot_sz = slot_sz - front_gap;
             if size < effective_slot_sz {
@@ -444,7 +466,7 @@ impl Arena {
                     user_ptr,
                     size,
                     effective_slot_sz,
-                    meta.checksum,
+                    checksum,
                 );
             }
         }
@@ -491,7 +513,7 @@ impl Arena {
                             slot_index: slot as u16,
                             arena_index: self.arena_index as u8,
                             _pad: 0,
-                            _pad2: 0,
+                            cached_size: 0,
                         };
                         count += 1;
                     }
@@ -524,7 +546,7 @@ impl Arena {
                                 slot_index: slot as u16,
                                 arena_index: self.arena_index as u8,
                                 _pad: 0,
-                                _pad2: 0,
+                                cached_size: 0,
                             };
                             count += 1;
                         }
@@ -572,38 +594,61 @@ impl Arena {
         &self,
         slab_raw: *mut u8,
         slot_index: u16,
-        slot_base_ptr: *mut u8,
         size: usize,
         class_idx: usize,
         align: usize,
     ) -> *mut u8 {
         let slab = &*(slab_raw as *mut Slab);
-        let meta = slab.get_slot_meta_mut(slot_index as usize);
+        let meta = slab.get_slot_meta_ref(slot_index as usize);
 
         let slot_sz = size_class::slot_size(class_idx);
+        let slot_base_ptr = slab.data.add(slot_index as usize * slot_sz);
+
+        // Fast path: when aligned_size >= slot_sz (very common: 16, 32, 64, 128...),
+        // gap is zero, user_ptr == slot_base. Skip alignment/gap computation.
         let aligned_size = align_up(size, crate::util::MIN_ALIGN);
-        let gap = if aligned_size >= slot_sz {
-            0
-        } else {
-            crate::util::align_down(slot_sz - aligned_size, align)
-        };
+        if aligned_size >= slot_sz {
+            meta.requested_size_store(size as u32);
+            meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+            let checksum = crate::hardening::integrity::compute_checksum(
+                slot_base_ptr as usize,
+                size as u32,
+                0,
+            );
+            meta.checksum_store(checksum);
+            // Still need back-gap canary when requested_size < slot_size
+            // (e.g., malloc(49) with slot_size=64: gap=0 but 15 bytes of back canary)
+            #[cfg(feature = "canaries")]
+            if size < slot_sz {
+                crate::hardening::canary::write_canary(
+                    slot_base_ptr,
+                    size,
+                    slot_sz,
+                    checksum,
+                );
+            }
+            return slot_base_ptr;
+        }
+
+        // Slow path: compute gap for right-alignment and canary regions
+        let gap = crate::util::align_down(slot_sz - aligned_size, align);
         let user_ptr = slot_base_ptr.add(gap);
 
-        meta.requested_size = size as u32;
-        meta.flags = 0;
+        meta.requested_size_store(size as u32);
+        meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
 
-        // Always compute metadata integrity checksum
-        meta.checksum = crate::hardening::integrity::compute_checksum(
+        let checksum = crate::hardening::integrity::compute_checksum(
             slot_base_ptr as usize,
-            meta.requested_size,
-            meta.flags,
+            size as u32,
+            0,
         );
+        meta.checksum_store(checksum);
 
-        // Use checksum value as canary for gap fill
+        // Write canary bytes in the gap regions
         #[cfg(feature = "canaries")]
         {
             if gap > 0 {
-                crate::hardening::canary::write_canary_front(slot_base_ptr, gap, meta.checksum);
+                crate::hardening::canary::write_canary_front(slot_base_ptr, gap, checksum);
             }
             let effective_slot_sz = slot_sz - gap;
             if size < effective_slot_sz {
@@ -611,14 +656,9 @@ impl Arena {
                     user_ptr,
                     size,
                     effective_slot_sz,
-                    meta.checksum,
+                    checksum,
                 );
             }
-        }
-
-        #[cfg(not(feature = "canaries"))]
-        {
-            let _ = gap;
         }
 
         user_ptr
@@ -712,20 +752,21 @@ impl Arena {
             None => return false,
         };
 
-        let meta = slab.get_slot_meta_mut(slot_idx);
+        let meta = slab.get_slot_meta_ref(slot_idx);
 
-        if meta.is_freed() {
+        // Atomic CAS double-free detection (race-free)
+        if !meta.try_mark_freed() {
             crate::hardening::abort_with_message("compatmalloc: double free detected\n");
         }
 
         let slot_sz = size_class::slot_size(slab.class_index);
         let slot_base = slab.slot_base(slot_idx);
 
-        // Always verify metadata integrity checksum
+        // Verify metadata integrity checksum (mask out freed bit we just set)
         if !crate::hardening::integrity::verify_checksum(
             slot_base as usize,
             meta.requested_size,
-            meta.flags,
+            meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01,
             meta.checksum,
         ) {
             crate::hardening::abort_with_message("compatmalloc: metadata integrity check failed\n");
@@ -760,8 +801,6 @@ impl Arena {
                 );
             }
         }
-
-        meta.mark_freed();
 
         // Zero (information leak defense) or poison (UAF detection).
         // Use slot_base for full slot coverage.
@@ -832,7 +871,7 @@ impl Arena {
 
         #[cfg(not(feature = "quarantine"))]
         {
-            slab.get_slot_meta_mut(slot_idx).clear();
+            slab.get_slot_meta_ref(slot_idx).clear();
             slab.bitmap.free_slot(slot_idx);
         }
 
@@ -856,7 +895,7 @@ impl Arena {
 
         if !entry.slab_ptr.is_null() {
             let slab = &mut *(entry.slab_ptr as *mut Slab);
-            slab.get_slot_meta_mut(entry.slot_index).clear();
+            slab.get_slot_meta_ref(entry.slot_index).clear();
             slab.bitmap.free_slot(entry.slot_index);
 
             // If slab is fully empty, return physical pages to kernel
@@ -952,7 +991,7 @@ impl Arena {
                     if !crate::hardening::integrity::verify_checksum(
                         slot_base as usize,
                         meta.requested_size,
-                        meta.flags,
+                        meta.flags.load(core::sync::atomic::Ordering::Relaxed),
                         meta.checksum,
                     ) {
                         result.checksum_failures += 1;
