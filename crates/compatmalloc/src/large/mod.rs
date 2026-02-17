@@ -1,6 +1,7 @@
 pub mod guard;
 
-use crate::hardening::metadata::{AllocationMeta, MetadataTable};
+use crate::hardening::metadata::{AllocationMeta, StripedMetadata};
+use crate::slab::page_map;
 use crate::sync::RawMutex;
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -46,7 +47,7 @@ impl LargeAllocator {
         }
     }
 
-    pub unsafe fn alloc(&self, size: usize, metadata: &MetadataTable) -> *mut u8 {
+    pub unsafe fn alloc(&self, size: usize, metadata: &StripedMetadata) -> *mut u8 {
         let alloc = match LargeAlloc::create(size) {
             Some(a) => a,
             None => return ptr::null_mut(),
@@ -89,10 +90,13 @@ impl LargeAllocator {
             return ptr::null_mut();
         }
 
+        // Register in page map for O(1) lookup
+        page_map::register_large(user_ptr, alloc.data_size);
+
         user_ptr
     }
 
-    pub unsafe fn free(&self, ptr: *mut u8, metadata: &MetadataTable) -> bool {
+    pub unsafe fn free(&self, ptr: *mut u8, metadata: &StripedMetadata) -> bool {
         self.lock.lock();
         let inner = &mut *self.inner.get();
 
@@ -111,8 +115,11 @@ impl LargeAllocator {
                     metadata.remove(ptr);
                     let base = data.base;
                     let total_size = data.total_size;
+                    let data_size = data.data_size;
                     entry.alloc = None;
                     self.lock.unlock();
+                    // Unregister from page map before unmapping
+                    page_map::unregister_large(ptr, data_size);
                     crate::platform::unmap(base, total_size);
                     return true;
                 }

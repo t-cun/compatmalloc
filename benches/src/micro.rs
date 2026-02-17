@@ -1,23 +1,40 @@
 /// Microbenchmarks for compatmalloc.
-/// Run with: cargo bench (requires criterion as dev-dependency)
 ///
 /// Since compatmalloc is a cdylib, these benchmarks measure the allocator
 /// through direct LD_PRELOAD testing rather than Rust criterion.
 /// See scripts/run_comparison.sh for the comparison runner.
 
+use std::hint::black_box;
 use std::time::Instant;
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn calloc(nmemb: usize, size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+}
+
+/// Get the allocator name from environment or default.
+fn allocator_name() -> String {
+    std::env::var("ALLOCATOR_NAME").unwrap_or_else(|_| "unknown".to_string())
+}
 
 /// Measure malloc/free latency for a given size, N iterations.
 fn bench_malloc_free(size: usize, iterations: usize) -> f64 {
+    // Warmup
+    for _ in 0..1000 {
+        unsafe {
+            let ptr = malloc(black_box(size));
+            std::ptr::write_bytes(ptr, 0xAB, std::cmp::min(size, 64));
+            free(black_box(ptr));
+        }
+    }
     let start = Instant::now();
     for _ in 0..iterations {
         unsafe {
-            let ptr = libc::malloc(size);
-            if !ptr.is_null() {
-                // Touch the memory to make it realistic
-                std::ptr::write_bytes(ptr as *mut u8, 0xAB, std::cmp::min(size, 64));
-                libc::free(ptr);
-            }
+            let ptr = malloc(black_box(size));
+            std::ptr::write_bytes(ptr, 0xAB, std::cmp::min(size, 64));
+            free(black_box(ptr));
         }
     }
     let elapsed = start.elapsed();
@@ -26,13 +43,17 @@ fn bench_malloc_free(size: usize, iterations: usize) -> f64 {
 
 /// Measure calloc/free latency.
 fn bench_calloc_free(size: usize, iterations: usize) -> f64 {
+    for _ in 0..1000 {
+        unsafe {
+            let ptr = calloc(black_box(1), black_box(size));
+            free(black_box(ptr));
+        }
+    }
     let start = Instant::now();
     for _ in 0..iterations {
         unsafe {
-            let ptr = libc::calloc(1, size);
-            if !ptr.is_null() {
-                libc::free(ptr);
-            }
+            let ptr = calloc(black_box(1), black_box(size));
+            free(black_box(ptr));
         }
     }
     let elapsed = start.elapsed();
@@ -44,13 +65,11 @@ fn bench_realloc_grow(iterations: usize) -> f64 {
     let start = Instant::now();
     for _ in 0..iterations {
         unsafe {
-            let mut ptr = libc::malloc(16);
-            for size in [32, 64, 128, 256, 512, 1024] {
-                ptr = libc::realloc(ptr, size);
+            let mut ptr = malloc(black_box(16));
+            for &size in black_box(&[32usize, 64, 128, 256, 512, 1024]) {
+                ptr = realloc(black_box(ptr), size);
             }
-            if !ptr.is_null() {
-                libc::free(ptr);
-            }
+            free(black_box(ptr));
         }
     }
     let elapsed = start.elapsed();
@@ -65,11 +84,9 @@ fn bench_threaded_throughput(num_threads: usize, ops_per_thread: usize, size: us
             std::thread::spawn(move || {
                 for _ in 0..ops_per_thread {
                     unsafe {
-                        let ptr = libc::malloc(size);
-                        if !ptr.is_null() {
-                            std::ptr::write_bytes(ptr as *mut u8, 0xCD, std::cmp::min(size, 16));
-                            libc::free(ptr);
-                        }
+                        let ptr = malloc(black_box(size));
+                        std::ptr::write_bytes(ptr, 0xCD, std::cmp::min(size, 16));
+                        free(black_box(ptr));
                     }
                 }
             })
@@ -86,19 +103,28 @@ fn bench_threaded_throughput(num_threads: usize, ops_per_thread: usize, size: us
 
 fn main() {
     let iterations = 1_000_000;
+    let name = allocator_name();
 
-    println!("=== compatmalloc microbenchmarks ===\n");
+    println!("=== microbenchmarks ({}) ===\n", name);
+
+    // Machine-parseable key results for comparison
+    let mut key_latency_64 = 0.0f64;
+    let mut key_throughput_1t = 0.0f64;
+    let mut key_throughput_4t = 0.0f64;
 
     println!("--- malloc/free latency (ns/op) ---");
     for &size in &[16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144] {
         let ns = bench_malloc_free(size, iterations);
-        println!("  size={:>8}: {:.1} ns", size, ns);
+        println!("  size={:>8}: {:>8.1} ns", size, ns);
+        if size == 64 {
+            key_latency_64 = ns;
+        }
     }
 
     println!("\n--- calloc/free latency (ns/op) ---");
     for &size in &[16, 64, 256, 1024, 4096, 65536] {
         let ns = bench_calloc_free(size, iterations);
-        println!("  size={:>8}: {:.1} ns", size, ns);
+        println!("  size={:>8}: {:>8.1} ns", size, ns);
     }
 
     println!("\n--- realloc grow pattern (ns/op) ---");
@@ -108,7 +134,14 @@ fn main() {
     println!("\n--- multi-threaded throughput (Mops/sec) ---");
     for &threads in &[1, 2, 4, 8] {
         let ops_sec = bench_threaded_throughput(threads, iterations / threads, 64);
-        println!("  threads={}: {:.2} Mops/sec", threads, ops_sec / 1_000_000.0);
+        let mops = ops_sec / 1_000_000.0;
+        println!("  threads={}: {:>6.2} Mops/sec", threads, mops);
+        if threads == 1 {
+            key_throughput_1t = mops;
+        }
+        if threads == 4 {
+            key_throughput_4t = mops;
+        }
     }
 
     println!("\n--- memory overhead ---");
@@ -120,9 +153,9 @@ fn main() {
 
     for _ in 0..count {
         unsafe {
-            let ptr = libc::malloc(alloc_size);
+            let ptr = malloc(alloc_size);
             if !ptr.is_null() {
-                std::ptr::write_bytes(ptr as *mut u8, 0, alloc_size);
+                std::ptr::write_bytes(ptr, 0, alloc_size);
                 ptrs.push(ptr);
             }
         }
@@ -143,8 +176,12 @@ fn main() {
     }
 
     for ptr in ptrs {
-        unsafe { libc::free(ptr) };
+        unsafe { free(ptr) };
     }
+
+    // Print machine-parseable summary line
+    println!("\nSUMMARY|{}|latency_64={:.1}|throughput_1t={:.2}|throughput_4t={:.2}",
+        name, key_latency_64, key_throughput_1t, key_throughput_4t);
 
     println!("\nDone.");
 }

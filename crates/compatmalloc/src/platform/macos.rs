@@ -43,11 +43,27 @@ pub fn num_cpus() -> usize {
     }
 }
 
+/// Get a cheap thread identifier for arena affinity.
+/// Cached in TLS to avoid a syscall on every allocation.
 #[inline]
 pub fn thread_id() -> usize {
-    unsafe {
-        let mut tid: u64 = 0;
-        libc::pthread_threadid_np(libc::pthread_self(), &mut tid);
-        tid as usize
+    use std::cell::Cell;
+
+    thread_local! {
+        static CACHED_TID: Cell<usize> = const { Cell::new(0) };
     }
+
+    CACHED_TID.with(|tid| {
+        let cached = tid.get();
+        if cached != 0 {
+            return cached;
+        }
+        let new_tid = unsafe {
+            let mut raw_tid: u64 = 0;
+            libc::pthread_threadid_np(libc::pthread_self(), &mut raw_tid);
+            raw_tid as usize
+        };
+        tid.set(new_tid);
+        new_tid
+    })
 }

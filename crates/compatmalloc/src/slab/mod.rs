@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod bitmap;
+pub mod page_map;
 pub mod size_class;
 
 pub use arena::Arena;

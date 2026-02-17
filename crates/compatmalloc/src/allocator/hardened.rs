@@ -1,5 +1,6 @@
-use crate::hardening::metadata::MetadataTable;
+use crate::hardening::metadata::StripedMetadata;
 use crate::large::LargeAllocator;
+use crate::slab::page_map;
 use crate::slab::{size_class_index, Arena};
 use crate::util::{align_up, MAX_ARENAS, MIN_ALIGN};
 use crate::{config, platform};
@@ -10,7 +11,7 @@ pub struct HardenedAllocator {
     arenas: [Arena; MAX_ARENAS],
     num_arenas: usize,
     large: LargeAllocator,
-    pub metadata: MetadataTable,
+    pub metadata: StripedMetadata,
     #[cfg(feature = "quarantine")]
     pub quarantine: crate::hardening::quarantine::Quarantine,
 }
@@ -25,7 +26,7 @@ impl HardenedAllocator {
             arenas: [ARENA; MAX_ARENAS],
             num_arenas: 1,
             large: LargeAllocator::new(),
-            metadata: MetadataTable::new(),
+            metadata: StripedMetadata::new(),
             #[cfg(feature = "quarantine")]
             quarantine: crate::hardening::quarantine::Quarantine::new(),
         }
@@ -33,6 +34,11 @@ impl HardenedAllocator {
 
     /// Initialize the allocator. Must be called before any allocations.
     pub unsafe fn init(&mut self) -> bool {
+        // Initialize the page map
+        if !page_map::init() {
+            return false;
+        }
+
         // Determine arena count
         let cpus = platform::num_cpus();
         let configured = config::arena_count();
@@ -41,6 +47,11 @@ impl HardenedAllocator {
         } else {
             cpus.min(MAX_ARENAS).max(1)
         };
+
+        // Set arena indices for page map registration
+        for i in 0..self.num_arenas {
+            self.arenas[i].set_arena_index(i);
+        }
 
         // Initialize metadata table
         if !self.metadata.init() {
@@ -74,6 +85,10 @@ impl HardenedAllocator {
 
         match size_class_index(alloc_size) {
             Some(class_idx) => {
+                // Thread cache fast path: try to reuse a cached slot
+                if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx) {
+                    return ptr;
+                }
                 let arena = self.select_arena();
                 arena.alloc(alloc_size, class_idx, &self.metadata)
             }
@@ -84,19 +99,100 @@ impl HardenedAllocator {
         }
     }
 
+    /// Try to allocate from the thread cache. Returns the pointer if successful.
+    /// On cache miss, batch-fills the cache from the arena for future hits.
+    #[inline]
+    unsafe fn try_cache_alloc(&self, size: usize, class_idx: usize) -> Option<*mut u8> {
+        use crate::allocator::thread_cache::{self, CachedSlot};
+
+        thread_cache::with_thread_cache(|cache| {
+            // Fast path: pop from cache
+            if let Some(cached) = cache.pop(class_idx) {
+                return Some(self.setup_cached_alloc(cached.ptr, size, class_idx));
+            }
+
+            // Cache miss: batch-fill from arena
+            const BATCH_SIZE: usize = 16;
+            let mut buf = [CachedSlot {
+                ptr: core::ptr::null_mut(),
+                slab_ptr: core::ptr::null_mut(),
+                slot_index: 0,
+                class_index: 0,
+            }; BATCH_SIZE];
+
+            let arena = self.select_arena();
+            let n = arena.alloc_batch_raw(class_idx, &mut buf, BATCH_SIZE);
+            if n == 0 {
+                return None;
+            }
+
+            // First slot goes to the caller, rest to the cache
+            let result = self.setup_cached_alloc(buf[0].ptr, size, class_idx);
+            for i in 1..n {
+                cache.push(class_idx, buf[i]);
+            }
+            Some(result)
+        })?
+    }
+
+    /// Set up metadata for a cached allocation slot.
+    #[inline]
+    unsafe fn setup_cached_alloc(&self, ptr: *mut u8, size: usize, class_idx: usize) -> *mut u8 {
+        let slot_sz = crate::slab::size_class::slot_size(class_idx);
+
+        #[cfg(feature = "canaries")]
+        {
+            let canary = crate::hardening::canary::generate_canary(ptr);
+            crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
+            self.metadata.insert(
+                ptr,
+                crate::hardening::metadata::AllocationMeta::new(size, canary),
+            );
+        }
+        #[cfg(not(feature = "canaries"))]
+        {
+            let _ = slot_sz;
+            self.metadata.insert(
+                ptr,
+                crate::hardening::metadata::AllocationMeta::new(size, 0),
+            );
+        }
+
+        ptr
+    }
+
     /// Free memory.
     pub unsafe fn free(&self, ptr: *mut u8) {
         if ptr.is_null() {
             return;
         }
 
-        // Try large allocator first (quick check)
+        // Use page map for O(1) dispatch
+        if let Some(info) = page_map::lookup(ptr) {
+            if info.is_large() {
+                self.large.free(ptr, &self.metadata);
+                return;
+            }
+            // Slab allocation: dispatch to the correct arena directly
+            let arena_idx = info.arena_index as usize;
+            if arena_idx < self.num_arenas {
+                self.arenas[arena_idx].free_direct(
+                    info.slab_ptr,
+                    ptr,
+                    &self.metadata,
+                    #[cfg(feature = "quarantine")]
+                    &self.quarantine,
+                );
+                return;
+            }
+        }
+
+        // Fallback: try large allocator then scan arenas
         if self.large.contains(ptr) {
             self.large.free(ptr, &self.metadata);
             return;
         }
 
-        // Try each arena
         for i in 0..self.num_arenas {
             if self.arenas[i].free(
                 ptr,
@@ -107,9 +203,6 @@ impl HardenedAllocator {
                 return;
             }
         }
-
-        // Pointer not found -- could be from bootstrap allocator or invalid
-        // In a hardened allocator we could abort, but for compatibility we ignore.
     }
 
     /// Reallocate memory.
@@ -203,12 +296,22 @@ impl HardenedAllocator {
             return 0;
         }
 
-        // Check large allocator
+        // Use page map for O(1) lookup
+        if let Some(info) = page_map::lookup(ptr) {
+            if info.is_large() {
+                if let Some(sz) = self.large.usable_size(ptr) {
+                    return sz;
+                }
+            } else {
+                return crate::slab::size_class::slot_size(info.class_index as usize);
+            }
+        }
+
+        // Fallback: check large allocator then scan arenas
         if let Some(sz) = self.large.usable_size(ptr) {
             return sz;
         }
 
-        // Check arenas
         for i in 0..self.num_arenas {
             if let Some(sz) = self.arenas[i].usable_size(ptr) {
                 return sz;

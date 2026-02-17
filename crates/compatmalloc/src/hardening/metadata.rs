@@ -168,6 +168,34 @@ impl MetadataTable {
         }
     }
 
+    /// Combined get + mark_freed in a single lock acquisition.
+    /// Returns the metadata before marking as freed.
+    pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        self.lock.lock();
+        let inner = &*self.inner.get();
+        if inner.entries.is_null() || inner.capacity == 0 {
+            self.lock.unlock();
+            return None;
+        }
+        let key = ptr as usize;
+        let mask = inner.capacity - 1;
+        let mut idx = hash_ptr(key) & mask;
+        loop {
+            let entry = &mut *inner.entries.add(idx);
+            if entry.key == key {
+                let result = entry.meta;
+                entry.meta.mark_freed();
+                self.lock.unlock();
+                return Some(result);
+            }
+            if entry.key == 0 {
+                self.lock.unlock();
+                return None;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
     pub unsafe fn remove(&self, ptr: *mut u8) {
         self.lock.lock();
         let inner = &mut *self.inner.get();
@@ -262,4 +290,61 @@ fn hash_ptr(key: usize) -> usize {
     let k = key as u64;
     let h = k.wrapping_mul(0x9E3779B97F4A7C15);
     (h >> 32) as usize ^ h as usize
+}
+
+// ============================================================================
+// Striped metadata: distributes entries across N tables to reduce contention
+// ============================================================================
+
+const NUM_META_STRIPES: usize = 8;
+
+/// Striped metadata table: distributes operations across N sub-tables
+/// based on the pointer address, reducing lock contention by N×.
+pub struct StripedMetadata {
+    tables: [MetadataTable; NUM_META_STRIPES],
+}
+
+impl StripedMetadata {
+    pub const fn new() -> Self {
+        const TABLE: MetadataTable = MetadataTable::new();
+        StripedMetadata {
+            tables: [TABLE; NUM_META_STRIPES],
+        }
+    }
+
+    #[inline]
+    fn stripe_for(&self, ptr: *mut u8) -> &MetadataTable {
+        // Use upper bits of page number for stripe selection
+        let idx = ((ptr as usize) >> 12) % NUM_META_STRIPES;
+        &self.tables[idx]
+    }
+
+    pub unsafe fn init(&self) -> bool {
+        for table in &self.tables {
+            if !table.init() {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub unsafe fn insert(&self, ptr: *mut u8, meta: AllocationMeta) {
+        self.stripe_for(ptr).insert(ptr, meta);
+    }
+
+    pub unsafe fn get(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        self.stripe_for(ptr).get(ptr)
+    }
+
+    pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        self.stripe_for(ptr).get_and_mark_freed(ptr)
+    }
+
+    pub unsafe fn mark_freed(&self, ptr: *mut u8) {
+        self.stripe_for(ptr).mark_freed(ptr);
+    }
+
+    pub unsafe fn remove(&self, ptr: *mut u8) {
+        self.stripe_for(ptr).remove(ptr);
+    }
 }
