@@ -111,7 +111,7 @@ pub fn fast_random_u64() -> u64 {
 }
 
 /// splitmix64 finalizer -- good hash for sequential inputs.
-#[inline]
+#[inline(always)]
 pub fn splitmix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);

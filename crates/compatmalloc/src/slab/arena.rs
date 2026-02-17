@@ -1,4 +1,4 @@
-use crate::hardening::metadata::{AllocationMeta, MetadataTable};
+use crate::hardening::metadata::AllocationMeta;
 use crate::platform;
 use crate::slab::bitmap::SlabBitmap;
 use crate::slab::page_map;
@@ -9,12 +9,53 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// Per-slot metadata stored inline in the slab header.
+/// Eliminates all hashing, locking, and backward-shift deletion from the hot path.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SlotMeta {
+    pub requested_size: u32,
+    pub canary: u64,
+    pub flags: u8,
+    _pad: [u8; 3],
+}
+
+const SLOT_META_FLAG_FREED: u8 = 0x01;
+
+impl SlotMeta {
+    pub const fn empty() -> Self {
+        SlotMeta {
+            requested_size: 0,
+            canary: 0,
+            flags: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_freed(&self) -> bool {
+        self.flags & SLOT_META_FLAG_FREED != 0
+    }
+
+    #[inline(always)]
+    pub fn mark_freed(&mut self) {
+        self.flags |= SLOT_META_FLAG_FREED;
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.requested_size = 0;
+        self.canary = 0;
+        self.flags = 0;
+    }
+}
+
 /// A single slab region for one size class.
 #[repr(C)]
 pub struct Slab {
     /// Start of the slot data region.
     pub data: *mut u8,
-    /// Total mapped size (data + bitmap + guard pages if enabled).
+    /// Total mapped size (data + bitmap + metadata + guard pages if enabled).
     #[allow(dead_code)]
     mapped_size: usize,
     /// Bitmap tracking free/allocated slots.
@@ -26,6 +67,8 @@ pub struct Slab {
     /// Whether any slot in this slab has ever been freed (for calloc optimization).
     /// AtomicBool to allow lock-free reads from calloc while writes happen under arena lock.
     pub ever_freed: AtomicBool,
+    /// Per-slot metadata array, co-allocated in the slab header region.
+    pub meta: *mut SlotMeta,
 }
 
 impl Slab {
@@ -36,15 +79,17 @@ impl Slab {
         let num_slots = size_class::slots_per_slab(class_index);
         let data_size = num_slots * slot_sz;
         let bitmap_bytes = SlabBitmap::storage_bytes(num_slots);
+        let meta_bytes = num_slots * core::mem::size_of::<SlotMeta>();
         let slab_header_size = core::mem::size_of::<Slab>();
 
-        let header_and_bitmap = align_up(slab_header_size + bitmap_bytes, PAGE_SIZE);
+        let header_and_bitmap_and_meta =
+            align_up(slab_header_size + bitmap_bytes + meta_bytes, PAGE_SIZE);
         let data_pages = align_up(data_size, PAGE_SIZE);
 
         #[cfg(feature = "guard-pages")]
-        let total_size = PAGE_SIZE + header_and_bitmap + data_pages + PAGE_SIZE;
+        let total_size = PAGE_SIZE + header_and_bitmap_and_meta + data_pages + PAGE_SIZE;
         #[cfg(not(feature = "guard-pages"))]
-        let total_size = header_and_bitmap + data_pages;
+        let total_size = header_and_bitmap_and_meta + data_pages;
 
         let base = platform::map_anonymous(total_size);
         if base.is_null() {
@@ -54,7 +99,10 @@ impl Slab {
         #[cfg(feature = "guard-pages")]
         {
             platform::protect_none(base, PAGE_SIZE);
-            platform::protect_none(base.add(PAGE_SIZE + header_and_bitmap + data_pages), PAGE_SIZE);
+            platform::protect_none(
+                base.add(PAGE_SIZE + header_and_bitmap_and_meta + data_pages),
+                PAGE_SIZE,
+            );
         }
 
         #[cfg(feature = "guard-pages")]
@@ -63,9 +111,13 @@ impl Slab {
         let header_ptr = base as *mut Slab;
 
         let bitmap_storage = (header_ptr as *mut u8).add(slab_header_size) as *mut u64;
-        let data_ptr = (header_ptr as *mut u8).add(header_and_bitmap);
+        let meta_storage =
+            (header_ptr as *mut u8).add(slab_header_size + bitmap_bytes) as *mut SlotMeta;
+        let data_ptr = (header_ptr as *mut u8).add(header_and_bitmap_and_meta);
 
         let bitmap = SlabBitmap::init(bitmap_storage, num_slots);
+
+        // mmap returns zeroed memory, so SlotMeta array is already zero-initialized
 
         header_ptr.write(Slab {
             data: data_ptr,
@@ -74,6 +126,7 @@ impl Slab {
             class_index,
             next: ptr::null_mut(),
             ever_freed: AtomicBool::new(false),
+            meta: meta_storage,
         });
 
         // Register data pages in the page map for O(1) lookup
@@ -88,19 +141,23 @@ impl Slab {
         header_ptr
     }
 
-    #[inline]
+    #[inline(always)]
     pub unsafe fn slot_ptr(&self, slot: usize) -> *mut u8 {
         let slot_sz = size_class::slot_size(self.class_index);
         self.data.add(slot * slot_sz)
     }
 
+    /// Compute slot index from pointer using division-free magic multiply.
+    #[inline(always)]
     pub fn slot_for_ptr(&self, ptr: *mut u8) -> Option<usize> {
         let offset = ptr as usize - self.data as usize;
         let slot_sz = size_class::slot_size(self.class_index);
-        if offset % slot_sz != 0 {
+        // Use magic multiplier instead of hardware div (~4 cycles vs ~25 cycles)
+        let slot = size_class::fast_div_slot(offset, self.class_index);
+        // Verify alignment: slot * slot_sz must equal offset
+        if slot * slot_sz != offset {
             return None;
         }
-        let slot = offset / slot_sz;
         let num_slots = size_class::slots_per_slab(self.class_index);
         if slot < num_slots {
             Some(slot)
@@ -118,6 +175,18 @@ impl Slab {
         let p = ptr as usize;
         p >= start && p < end
     }
+
+    /// Get per-slot metadata for a given slot index (no lock needed).
+    #[inline(always)]
+    pub unsafe fn get_slot_meta(&self, slot: usize) -> &SlotMeta {
+        &*self.meta.add(slot)
+    }
+
+    /// Get mutable per-slot metadata for a given slot index.
+    #[inline(always)]
+    pub unsafe fn get_slot_meta_mut(&self, slot: usize) -> &mut SlotMeta {
+        &mut *self.meta.add(slot)
+    }
 }
 
 struct SlabList {
@@ -134,13 +203,12 @@ impl SlabList {
 
 struct ArenaInner {
     slab_lists: [SlabList; NUM_SIZE_CLASSES],
-    metadata: MetadataTable,
     #[cfg(feature = "quarantine")]
     quarantine: crate::hardening::quarantine::QuarantineRing,
 }
 
-/// One arena: contains slab lists for every size class, per-arena metadata,
-/// and per-arena quarantine. All protected by a single lock.
+/// One arena: contains slab lists for every size class and per-arena quarantine.
+/// Metadata is stored per-slab inline (no per-arena hash table).
 /// Cache-line aligned to prevent false sharing between arenas.
 #[repr(C, align(128))]
 pub struct Arena {
@@ -159,7 +227,6 @@ impl Arena {
             lock: RawMutex::new(),
             inner: UnsafeCell::new(ArenaInner {
                 slab_lists: [EMPTY; NUM_SIZE_CLASSES],
-                metadata: MetadataTable::new(),
                 #[cfg(feature = "quarantine")]
                 quarantine: crate::hardening::quarantine::QuarantineRing::new(),
             }),
@@ -172,10 +239,9 @@ impl Arena {
         self.arena_index = idx;
     }
 
-    /// Initialize per-arena metadata table.
+    /// Initialize per-arena state. With per-slab metadata, no hash table init needed.
     pub unsafe fn init_metadata(&self) -> bool {
-        let inner = &mut *self.inner.get();
-        inner.metadata.init()
+        true
     }
 
     /// Configure quarantine max_bytes for this arena.
@@ -185,13 +251,52 @@ impl Arena {
         inner.quarantine.set_max_bytes(max);
     }
 
-    /// Get allocation metadata (takes arena lock).
+    /// Get allocation metadata by looking up per-slab metadata (takes arena lock).
     pub unsafe fn get_metadata(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         self.lock.lock();
         let inner = &*self.inner.get();
-        let result = inner.metadata.get_unlocked(ptr);
+        let result = Self::get_metadata_inner(inner, ptr);
         self.lock.unlock();
         result
+    }
+
+    unsafe fn get_metadata_inner(inner: &ArenaInner, ptr: *mut u8) -> Option<AllocationMeta> {
+        for list in &inner.slab_lists {
+            let mut slab_ptr = list.head;
+            while !slab_ptr.is_null() {
+                let slab = &*slab_ptr;
+                if slab.contains(ptr) {
+                    if let Some(slot) = slab.slot_for_ptr(ptr) {
+                        let slot_meta = slab.get_slot_meta(slot);
+                        let mut alloc_meta = AllocationMeta::new(
+                            slot_meta.requested_size as usize,
+                            slot_meta.canary,
+                        );
+                        if slot_meta.is_freed() {
+                            alloc_meta.mark_freed();
+                        }
+                        return Some(alloc_meta);
+                    }
+                }
+                slab_ptr = slab.next;
+            }
+        }
+        None
+    }
+
+    /// Get slot metadata using slab pointer + slot index (lock-free read).
+    /// Used by hardened.rs for realloc and other metadata lookups.
+    pub unsafe fn get_slot_meta_from_slab(
+        slab_raw: *mut u8,
+        ptr: *mut u8,
+    ) -> Option<(SlotMeta, usize)> {
+        let slab = &*(slab_raw as *mut Slab);
+        if let Some(slot) = slab.slot_for_ptr(ptr) {
+            let meta = *slab.get_slot_meta(slot);
+            Some((meta, slot))
+        } else {
+            None
+        }
     }
 
     pub unsafe fn alloc(&self, size: usize, class_index: usize) -> *mut u8 {
@@ -214,7 +319,7 @@ impl Arena {
         let mut slab_ptr = list.head;
         while !slab_ptr.is_null() {
             let slab = &mut *slab_ptr;
-            if let Some(ptr) = Self::try_alloc_from_slab(slab, size, &inner.metadata) {
+            if let Some(ptr) = Self::try_alloc_from_slab(slab, size) {
                 return ptr;
             }
             slab_ptr = slab.next;
@@ -230,34 +335,40 @@ impl Arena {
         (*new_slab).next = list.head;
         list.head = new_slab;
 
-        Self::try_alloc_from_slab(&mut *new_slab, size, &inner.metadata)
-            .unwrap_or(ptr::null_mut())
+        Self::try_alloc_from_slab(&mut *new_slab, size).unwrap_or(ptr::null_mut())
     }
 
-    unsafe fn try_alloc_from_slab(
-        slab: &mut Slab,
-        size: usize,
-        metadata: &MetadataTable,
-    ) -> Option<*mut u8> {
+    unsafe fn try_alloc_from_slab(slab: &mut Slab, size: usize) -> Option<*mut u8> {
         #[cfg(feature = "slot-randomization")]
-        let slot = slab.bitmap.alloc_random(platform::fast_random_u64())?;
+        let slot = slab.bitmap.alloc_random(crate::allocator::thread_cache::fast_random_u64())?;
         #[cfg(not(feature = "slot-randomization"))]
         let slot = slab.bitmap.alloc_first_free()?;
 
         let ptr = slab.slot_ptr(slot);
-        let slot_sz = size_class::slot_size(slab.class_index);
+
+        // Write metadata directly to per-slab array (no hash, no lock)
+        let meta = slab.get_slot_meta_mut(slot);
 
         #[cfg(feature = "canaries")]
         {
-            let canary = crate::hardening::canary::generate_canary(ptr);
-            crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
-            metadata.insert_unlocked(ptr, AllocationMeta::new(size, canary));
+            let slot_sz = size_class::slot_size(slab.class_index);
+            let gap = slot_sz - size;
+            if gap > 0 {
+                let canary = crate::hardening::canary::generate_canary(ptr);
+                crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
+                meta.canary = canary;
+            } else {
+                meta.canary = 0;
+            }
+            meta.requested_size = size as u32;
+            meta.flags = 0;
         }
 
         #[cfg(not(feature = "canaries"))]
         {
-            let _ = slot_sz;
-            metadata.insert_unlocked(ptr, AllocationMeta::new(size, 0));
+            meta.requested_size = size as u32;
+            meta.canary = 0;
+            meta.flags = 0;
         }
 
         Some(ptr)
@@ -284,7 +395,7 @@ impl Arena {
             let slab = &mut *slab_ptr;
             while count < max_count {
                 #[cfg(feature = "slot-randomization")]
-                let slot_opt = slab.bitmap.alloc_random(platform::fast_random_u64());
+                let slot_opt = slab.bitmap.alloc_random(crate::allocator::thread_cache::fast_random_u64());
                 #[cfg(not(feature = "slot-randomization"))]
                 let slot_opt = slab.bitmap.alloc_first_free();
 
@@ -293,9 +404,10 @@ impl Arena {
                         buf[count] = crate::allocator::thread_cache::CachedSlot {
                             ptr: slab.slot_ptr(slot),
                             slab_ptr: slab as *mut Slab as *mut u8,
-                            slot_index: slot,
-                            class_index,
-                            arena_index: self.arena_index,
+                            slot_index: slot as u16,
+                            arena_index: self.arena_index as u8,
+                            _pad: 0,
+                            _pad2: 0,
                         };
                         count += 1;
                     }
@@ -314,7 +426,7 @@ impl Arena {
                 let slab = &mut *new_slab;
                 while count < max_count {
                     #[cfg(feature = "slot-randomization")]
-                    let slot_opt = slab.bitmap.alloc_random(platform::fast_random_u64());
+                    let slot_opt = slab.bitmap.alloc_random(crate::allocator::thread_cache::fast_random_u64());
                     #[cfg(not(feature = "slot-randomization"))]
                     let slot_opt = slab.bitmap.alloc_first_free();
 
@@ -323,9 +435,10 @@ impl Arena {
                             buf[count] = crate::allocator::thread_cache::CachedSlot {
                                 ptr: slab.slot_ptr(slot),
                                 slab_ptr: slab as *mut Slab as *mut u8,
-                                slot_index: slot,
-                                class_index,
-                                arena_index: self.arena_index,
+                                slot_index: slot as u16,
+                                arena_index: self.arena_index as u8,
+                                _pad: 0,
+                                _pad2: 0,
                             };
                             count += 1;
                         }
@@ -353,37 +466,47 @@ impl Arena {
             let cached = &slots[i];
             if !cached.slab_ptr.is_null() {
                 let slab = &mut *(cached.slab_ptr as *mut Slab);
-                slab.bitmap.free_slot(cached.slot_index);
+                slab.bitmap.free_slot(cached.slot_index as usize);
             }
         }
         self.lock.unlock();
     }
 
     /// Set up metadata for a cached allocation slot.
-    /// Canary write is lock-free (per-slot, no contention).
-    /// Metadata insertion uses the metadata table's own internal lock.
+    /// Writes directly to per-slab inline metadata -- NO lock needed.
+    #[inline(always)]
     pub unsafe fn setup_cached_alloc_metadata(
         &self,
+        slab_raw: *mut u8,
+        slot_index: u16,
         ptr: *mut u8,
         size: usize,
         class_idx: usize,
     ) {
-        let slot_sz = size_class::slot_size(class_idx);
+        let slab = &*(slab_raw as *mut Slab);
+        let meta = slab.get_slot_meta_mut(slot_index as usize);
 
         #[cfg(feature = "canaries")]
         {
-            let canary = crate::hardening::canary::generate_canary(ptr);
-            crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
-            // Use the locked insert -- no arena lock needed here
-            let inner = &*self.inner.get();
-            inner.metadata.insert(ptr, AllocationMeta::new(size, canary));
+            let slot_sz = size_class::slot_size(class_idx);
+            let gap = slot_sz - size;
+            if gap > 0 {
+                // Only generate and write canary when there's a gap to protect
+                let canary = crate::hardening::canary::generate_canary(ptr);
+                crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
+                meta.canary = canary;
+            } else {
+                meta.canary = 0;
+            }
+            meta.requested_size = size as u32;
+            meta.flags = 0;
         }
 
         #[cfg(not(feature = "canaries"))]
         {
-            let _ = slot_sz;
-            let inner = &*self.inner.get();
-            inner.metadata.insert(ptr, AllocationMeta::new(size, 0));
+            meta.requested_size = size as u32;
+            meta.canary = 0;
+            meta.flags = 0;
         }
     }
 
@@ -406,7 +529,23 @@ impl Arena {
         result
     }
 
-    /// Batch-free from deferred free buffer: perform security checks + free under one lock.
+    /// Free a pointer whose security checks have already been done eagerly.
+    /// Only does poison + quarantine/bitmap under the arena lock.
+    pub unsafe fn free_direct_prechecked(
+        &self,
+        slab_raw: *mut u8,
+        ptr: *mut u8,
+        slot_idx: usize,
+    ) {
+        self.lock.lock();
+        let inner = &mut *self.inner.get();
+        let slab = &mut *(slab_raw as *mut Slab);
+        Self::free_from_slab_prechecked(inner, slab, ptr, slot_idx);
+        self.lock.unlock();
+    }
+
+    /// Batch-free from deferred free buffer. Security checks (canary, double-free)
+    /// have already been done eagerly. Only does poison + quarantine/bitmap.
     pub unsafe fn free_batch_deferred(
         &self,
         slots: &[crate::allocator::thread_cache::CachedSlot],
@@ -421,7 +560,12 @@ impl Arena {
             let cached = &slots[i];
             if !cached.slab_ptr.is_null() {
                 let slab = &mut *(cached.slab_ptr as *mut Slab);
-                Self::free_from_slab(inner, slab, cached.ptr);
+                Self::free_from_slab_prechecked(
+                    inner,
+                    slab,
+                    cached.ptr,
+                    cached.slot_index as usize,
+                );
             }
         }
         self.lock.unlock();
@@ -447,77 +591,110 @@ impl Arena {
             None => return false,
         };
 
-        if let Some(meta) = inner.metadata.get_and_mark_freed_unlocked(ptr) {
-            if meta.is_freed() {
-                crate::hardening::abort_with_message("compatmalloc: double free detected\n");
-            }
+        let meta = slab.get_slot_meta_mut(slot_idx);
 
-            #[cfg(any(feature = "canaries", feature = "poison-on-free"))]
-            let slot_sz = size_class::slot_size(slab.class_index);
+        if meta.is_freed() {
+            crate::hardening::abort_with_message("compatmalloc: double free detected\n");
+        }
 
-            #[cfg(feature = "canaries")]
-            {
-                if !crate::hardening::canary::check_canary(
+        let requested_size = meta.requested_size as usize;
+
+        #[cfg(any(feature = "canaries", feature = "poison-on-free"))]
+        let slot_sz = size_class::slot_size(slab.class_index);
+
+        #[cfg(feature = "canaries")]
+        {
+            let gap = slot_sz - requested_size;
+            if gap > 0
+                && !crate::hardening::canary::check_canary(
                     ptr,
-                    meta.requested_size,
+                    requested_size,
                     slot_sz,
-                    meta.canary_value,
-                ) {
-                    crate::hardening::abort_with_message(
-                        "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
-                    );
-                }
-            }
-
-            // Zero (information leak defense) or poison (UAF detection).
-            #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
+                    meta.canary,
+                )
             {
-                ptr::write_bytes(ptr, 0, meta.requested_size);
+                crate::hardening::abort_with_message(
+                    "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
+                );
             }
+        }
 
-            #[cfg(feature = "poison-on-free")]
-            {
-                crate::hardening::poison::poison_region(ptr, slot_sz);
-            }
+        meta.mark_freed();
 
-            slab.ever_freed.store(true, Ordering::Relaxed);
+        // Zero (information leak defense) or poison (UAF detection).
+        #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
+        {
+            ptr::write_bytes(ptr, 0, requested_size);
+        }
 
-            #[cfg(feature = "quarantine")]
-            {
-                use crate::hardening::quarantine::QuarantineEntry;
-                let q_entry = QuarantineEntry {
-                    ptr,
-                    size: slot_sz,
-                    slab_ptr: slab as *mut Slab as *mut u8,
-                    slot_index: slot_idx,
-                    class_index: slab.class_index,
-                };
-                let metadata = &inner.metadata;
-                // Recycle each evicted entry inline via callback -- no entry can be lost
-                inner.quarantine.push_enriched(q_entry, |evicted| {
-                    Self::recycle_evicted_inline(metadata, evicted);
-                });
-                return true;
-            }
+        #[cfg(feature = "poison-on-free")]
+        {
+            crate::hardening::poison::poison_region(ptr, slot_sz);
+        }
+
+        slab.ever_freed.store(true, Ordering::Relaxed);
+
+        #[cfg(feature = "quarantine")]
+        {
+            use crate::hardening::quarantine::QuarantineEntry;
+            let q_entry = QuarantineEntry {
+                ptr,
+                size: size_class::slot_size(slab.class_index),
+                slab_ptr: slab as *mut Slab as *mut u8,
+                slot_index: slot_idx,
+                class_index: slab.class_index,
+            };
+            // Recycle each evicted entry inline via callback -- no entry can be lost
+            inner.quarantine.push_enriched(q_entry, |evicted| {
+                Self::recycle_evicted_inline(evicted);
+            });
         }
 
         #[cfg(not(feature = "quarantine"))]
         {
+            // Clear metadata and free the slot
+            meta.clear();
             slab.bitmap.free_slot(slot_idx);
         }
-
-        #[cfg(feature = "quarantine")]
-        let _ = slot_idx;
 
         true
     }
 
+    /// Free a slot whose security checks (canary, double-free, poison, ever_freed)
+    /// have already been done eagerly. Only does quarantine/bitmap under the arena lock.
+    unsafe fn free_from_slab_prechecked(
+        inner: &mut ArenaInner,
+        slab: &mut Slab,
+        ptr: *mut u8,
+        slot_idx: usize,
+    ) {
+        #[cfg(feature = "quarantine")]
+        {
+            use crate::hardening::quarantine::QuarantineEntry;
+            let q_entry = QuarantineEntry {
+                ptr,
+                size: size_class::slot_size(slab.class_index),
+                slab_ptr: slab as *mut Slab as *mut u8,
+                slot_index: slot_idx,
+                class_index: slab.class_index,
+            };
+            inner.quarantine.push_enriched(q_entry, |evicted| {
+                Self::recycle_evicted_inline(evicted);
+            });
+        }
+
+        #[cfg(not(feature = "quarantine"))]
+        {
+            slab.get_slot_meta_mut(slot_idx).clear();
+            slab.bitmap.free_slot(slot_idx);
+        }
+
+        let _ = inner;
+    }
+
     /// Recycle a quarantine-evicted slot inline (for use in push callback).
     #[cfg(feature = "quarantine")]
-    unsafe fn recycle_evicted_inline(
-        metadata: &MetadataTable,
-        entry: &crate::hardening::quarantine::QuarantineEntry,
-    ) {
+    unsafe fn recycle_evicted_inline(entry: &crate::hardening::quarantine::QuarantineEntry) {
         let ptr = entry.ptr;
 
         #[cfg(feature = "write-after-free-check")]
@@ -530,10 +707,13 @@ impl Arena {
             }
         }
 
+        let _ = ptr;
+
         if !entry.slab_ptr.is_null() {
             let slab = &mut *(entry.slab_ptr as *mut Slab);
+            // Clear per-slab metadata (no hash table removal needed)
+            slab.get_slot_meta_mut(entry.slot_index).clear();
             slab.bitmap.free_slot(entry.slot_index);
-            metadata.remove_unlocked(ptr);
         }
     }
 

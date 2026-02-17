@@ -5,23 +5,30 @@
 //! - `free` fast path: push to thread cache free buffer (no lock)
 //! - When free buffer is full: flush batch to arena (amortized locking)
 //! - When alloc cache is empty on malloc: batch-fill from arena
+//!
+//! All thread-local state (cache, thread ID, RNG) is consolidated into a
+//! single ThreadState struct using UnsafeCell + bool reentrancy guard,
+//! eliminating RefCell overhead and multiple TLS lookups.
 
 use crate::slab::size_class::NUM_SIZE_CLASSES;
 
 /// Maximum cached slots per size class (for allocation).
-const CACHE_SIZE: usize = 32;
+const CACHE_SIZE: usize = 64;
 
 /// Maximum deferred free slots per size class.
-const FREE_CACHE_SIZE: usize = 16;
+const FREE_CACHE_SIZE: usize = 64;
 
 /// A cached free slot: pointer + slab info for O(1) recycle.
+/// Compact layout: 24 bytes (down from 40) for better cache utilization.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct CachedSlot {
     pub ptr: *mut u8,
     pub slab_ptr: *mut u8,
-    pub slot_index: usize,
-    pub class_index: usize,
-    pub arena_index: usize,
+    pub slot_index: u16,
+    pub arena_index: u8,
+    pub _pad: u8,
+    pub _pad2: u32,
 }
 
 /// Per-size-class cache: a small stack of free slots + deferred free buffer.
@@ -40,8 +47,9 @@ impl ClassCache {
             ptr: core::ptr::null_mut(),
             slab_ptr: core::ptr::null_mut(),
             slot_index: 0,
-            class_index: 0,
             arena_index: 0,
+            _pad: 0,
+            _pad2: 0,
         };
         ClassCache {
             alloc_slots: [EMPTY; CACHE_SIZE],
@@ -98,6 +106,30 @@ impl ClassCache {
         count
     }
 
+    /// Recycle entries from the free buffer to the alloc cache.
+    /// Returns the number of entries remaining in the free buffer (for arena flush).
+    /// Moves up to `max_recycle` entries from free to alloc. Remaining entries
+    /// stay in the free buffer for later quarantine flush.
+    #[inline]
+    fn recycle_frees_to_alloc(&mut self, max_recycle: usize) -> usize {
+        let available = self.free_count;
+        if available == 0 {
+            return 0;
+        }
+        let to_recycle = available.min(max_recycle).min(CACHE_SIZE - self.alloc_count);
+        if to_recycle == 0 {
+            return available;
+        }
+        // Move the newest entries (end of free buffer) to alloc cache
+        let start = available - to_recycle;
+        for i in 0..to_recycle {
+            self.alloc_slots[self.alloc_count] = self.free_slots[start + i];
+            self.alloc_count += 1;
+        }
+        self.free_count = start;
+        start // remaining in free buffer
+    }
+
     /// Drain half the alloc cache into a buffer, returning the number drained.
     fn drain_half(&mut self, buf: &mut [CachedSlot; CACHE_SIZE]) -> usize {
         let to_drain = self.alloc_count / 2;
@@ -150,14 +182,22 @@ impl ThreadCache {
         self.caches[class_index].free_is_full()
     }
 
+    /// Recycle free buffer entries to alloc cache (lock-free fast path).
+    /// Returns the number of entries remaining in the free buffer.
+    #[inline]
+    pub fn recycle_frees(&mut self, class_index: usize, max_recycle: usize) -> usize {
+        self.caches[class_index].recycle_frees_to_alloc(max_recycle)
+    }
+
     /// Drain all deferred frees for a size class. Returns (buffer, count).
     pub fn drain_frees(&mut self, class_index: usize) -> ([CachedSlot; FREE_CACHE_SIZE], usize) {
         let mut buf = [CachedSlot {
             ptr: core::ptr::null_mut(),
             slab_ptr: core::ptr::null_mut(),
             slot_index: 0,
-            class_index: 0,
             arena_index: 0,
+            _pad: 0,
+            _pad2: 0,
         }; FREE_CACHE_SIZE];
         let count = self.caches[class_index].drain_frees(&mut buf);
         (buf, count)
@@ -169,30 +209,131 @@ impl ThreadCache {
             ptr: core::ptr::null_mut(),
             slab_ptr: core::ptr::null_mut(),
             slot_index: 0,
-            class_index: 0,
             arena_index: 0,
+            _pad: 0,
+            _pad2: 0,
         }; CACHE_SIZE];
         let count = self.caches[class_index].drain_half(&mut buf);
         (buf, count)
     }
 }
 
+/// Consolidated thread-local state: cache + thread ID + RNG.
+/// Uses UnsafeCell + bool reentrancy guard instead of RefCell for lower overhead.
+struct ThreadState {
+    cache: ThreadCache,
+    tid: usize,
+    rng: u64,
+    active: bool,
+}
+
+impl ThreadState {
+    const fn new() -> Self {
+        ThreadState {
+            cache: ThreadCache::new(),
+            tid: 0,
+            rng: 0,
+            active: false,
+        }
+    }
+
+    /// Get or compute the thread ID.
+    #[inline]
+    fn thread_id(&mut self) -> usize {
+        if self.tid != 0 {
+            return self.tid;
+        }
+        let new_tid = unsafe { libc::syscall(libc::SYS_gettid) as usize };
+        self.tid = new_tid;
+        new_tid
+    }
+
+    /// Get a fast random u64 using xorshift64*.
+    #[inline]
+    fn fast_random(&mut self) -> u64 {
+        let mut s = self.rng;
+        if s == 0 {
+            // Seed from stack address + thread id for uniqueness
+            let stack_addr = &s as *const _ as u64;
+            s = stack_addr
+                .wrapping_mul(0x517cc1b727220a95)
+                .wrapping_add(self.thread_id() as u64)
+                | 1; // ensure non-zero
+        }
+        // xorshift64*
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        self.rng = s;
+        s.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+/// Access the consolidated thread-local state. Returns None if TLS is not available
+/// (e.g., during very early init or thread destruction) or if already entered (reentrant).
+#[inline(always)]
+fn with_thread_state<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut ThreadState) -> R,
+{
+    use core::cell::UnsafeCell;
+
+    thread_local! {
+        static STATE: UnsafeCell<ThreadState> = const { UnsafeCell::new(ThreadState::new()) };
+    }
+
+    STATE.with(|cell| {
+        let state = unsafe { &mut *cell.get() };
+        if state.active {
+            // Reentrant call (e.g., recursive malloc from thread_local init)
+            return None;
+        }
+        state.active = true;
+        let result = f(state);
+        state.active = false;
+        Some(result)
+    })
+}
+
 /// Access the thread-local cache. Returns None if TLS is not available
 /// (e.g., during very early init or thread destruction).
-#[inline]
+/// Thin wrapper around with_thread_state for backward compatibility.
+#[inline(always)]
 pub fn with_thread_cache<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut ThreadCache) -> R,
 {
-    use std::cell::RefCell;
+    with_thread_state(|state| f(&mut state.cache))
+}
 
-    thread_local! {
-        static CACHE: RefCell<ThreadCache> = const { RefCell::new(ThreadCache::new()) };
-    }
-
-    CACHE.with(|cell| {
-        // Use try_borrow_mut to avoid panicking if we're already in the cache
-        // (e.g., recursive malloc from thread_local init)
-        cell.try_borrow_mut().ok().map(|mut cache| f(&mut cache))
+/// Access both the thread-local cache and thread ID in a single TLS access.
+/// Avoids the reentrant TLS fallback that occurs when select_arena() is called
+/// inside a with_thread_cache() closure.
+#[inline(always)]
+pub fn with_cache_and_tid<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut ThreadCache, usize) -> R,
+{
+    with_thread_state(|state| {
+        let tid = state.thread_id();
+        f(&mut state.cache, tid)
     })
+}
+
+/// Get thread ID from consolidated state, or fallback to platform.
+#[inline]
+pub fn thread_id() -> usize {
+    match with_thread_state(|state| state.thread_id()) {
+        Some(tid) => tid,
+        None => crate::platform::thread_id(),
+    }
+}
+
+/// Get fast random from consolidated state, or fallback to platform.
+#[inline]
+pub fn fast_random_u64() -> u64 {
+    match with_thread_state(|state| state.fast_random()) {
+        Some(val) => val,
+        None => crate::platform::fast_random_u64(),
+    }
 }

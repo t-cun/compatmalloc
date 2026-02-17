@@ -3,8 +3,8 @@
 //! This provides O(1) lookup from any pointer to the slab (or large allocation) that owns it,
 //! eliminating all O(n) scans in free, recycle, and usable_size paths.
 //!
-//! Level 1: 2^21 entries covering 48-bit address space in 128KB chunks (each L1 entry covers 32 pages)
-//! Level 2: lazily allocated, 32 AtomicU64 entries per L1 slot covering individual 4KB pages
+//! Level 1: 2^14 entries (128KB) covering 128GB address space
+//! Level 2: lazily allocated, 2048 AtomicU64 entries per L1 slot covering individual 4KB pages
 //!
 //! Each L2 entry packs PageInfo into a single AtomicU64 to eliminate torn reads:
 //!   Bit 63: large allocation flag
@@ -69,7 +69,7 @@ fn pack_large() -> u64 {
 }
 
 /// Unpack a u64 into a PageInfo. Returns None for empty (0).
-#[inline]
+#[inline(always)]
 fn unpack(packed: u64) -> Option<PageInfo> {
     if packed == 0 {
         return None;
@@ -93,13 +93,16 @@ fn unpack(packed: u64) -> Option<PageInfo> {
 }
 
 /// Number of pages covered by each L1 entry.
-const L2_SIZE: usize = 32;
+const L2_SIZE: usize = 2048;
 
-/// Number of L1 entries. Uses bits [17..38) of the address (21 bits = 2M entries).
-const L1_BITS: usize = 21;
+/// Bits to shift page number to get L2 index.
+const L2_BITS: usize = 11; // log2(2048)
+
+/// Number of L1 entries. 2^14 = 16384 entries, covers 16384 * 2048 * 4KB = 128GB.
+const L1_BITS: usize = 14;
 const L1_SIZE: usize = 1 << L1_BITS;
 
-/// A level-2 page map block: 32 AtomicU64 entries for 32 consecutive pages.
+/// A level-2 page map block: 2048 AtomicU64 entries for 2048 consecutive pages.
 #[repr(C)]
 struct L2Block {
     entries: [AtomicU64; L2_SIZE],
@@ -143,8 +146,8 @@ impl PageMap {
     fn indices(ptr: *mut u8) -> (usize, usize) {
         let addr = ptr as usize;
         let page = addr / PAGE_SIZE;
-        let l1_idx = (page >> 5) & (L1_SIZE - 1); // bits [5..26) of the page number
-        let l2_idx = page & (L2_SIZE - 1); // bits [0..5) of the page number
+        let l2_idx = page & (L2_SIZE - 1); // bits [0..11) of the page number
+        let l1_idx = (page >> L2_BITS) & (L1_SIZE - 1); // bits [11..25) of the page number
         (l1_idx, l2_idx)
     }
 
@@ -239,18 +242,21 @@ impl PageMap {
     }
 
     /// Look up the page info for a pointer. Returns None if the page is not registered.
-    #[inline]
+    /// The page map must be initialized before calling this (guaranteed by allocator init).
+    #[inline(always)]
     pub unsafe fn lookup(&self, ptr: *mut u8) -> Option<PageInfo> {
-        if !self.initialized.load(Ordering::Relaxed) {
+        // Skip initialized check -- init() is called before any allocation.
+        // The l1 null check below catches the uninitialized case safely.
+        let l1 = self.l1;
+        if l1.is_null() {
             return None;
         }
         let (l1_idx, l2_idx) = Self::indices(ptr);
-        let slot = &*self.l1.add(l1_idx);
-        let l2 = slot.load(Ordering::Acquire);
+        let l2 = (*l1.add(l1_idx)).load(Ordering::Relaxed);
         if l2.is_null() {
             return None;
         }
-        let packed = (*l2).entries[l2_idx].load(Ordering::Acquire);
+        let packed = (*l2).entries[l2_idx].load(Ordering::Relaxed);
         unpack(packed)
     }
 }
@@ -288,7 +294,7 @@ pub unsafe fn unregister_large(user_ptr: *mut u8, data_size: usize) {
 }
 
 /// Look up page info for a pointer.
-#[inline]
+#[inline(always)]
 pub unsafe fn lookup(ptr: *mut u8) -> Option<PageInfo> {
     (*PAGE_MAP.0.get()).lookup(ptr)
 }

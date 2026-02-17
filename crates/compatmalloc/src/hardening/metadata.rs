@@ -149,24 +149,28 @@ impl MetadataTable {
     // ========================================================================
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn insert_unlocked(&self, ptr: *mut u8, meta: AllocationMeta) {
         let inner = &mut *self.inner.get();
         Self::insert_inner(inner, ptr, meta);
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn get_unlocked(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         let inner = &*self.inner.get();
         Self::get_inner(inner, ptr)
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn get_and_mark_freed_unlocked(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         let inner = &*self.inner.get();
         Self::get_and_mark_freed_inner(inner, ptr)
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn remove_unlocked(&self, ptr: *mut u8) {
         let inner = &mut *self.inner.get();
         Self::remove_inner(inner, ptr);

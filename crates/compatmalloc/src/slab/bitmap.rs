@@ -82,25 +82,44 @@ impl SlabBitmap {
     }
 
     /// Allocate a random free slot using the given random value.
-    /// Falls back to first-free if the random probe misses.
+    /// Uses fast range reduction and trailing_zeros instead of iterative nth_set_bit.
     #[cfg(feature = "slot-randomization")]
+    #[inline(always)]
     pub fn alloc_random(&mut self, random: u64) -> Option<usize> {
         if self.free_count == 0 {
             return None;
         }
 
-        // Pick a random starting word
-        let start_word = (random as usize) % self.num_words;
+        // Fast range reduction: (random * num_slots) >> 64. No division!
+        let start = ((random as u128 * self.num_slots as u128) >> 64) as usize;
+        let start_word = start / 64; // shift, not div
+        let start_bit = start & 63; // mask, not mod
 
-        // Search from the random start, wrapping around
-        for offset in 0..self.num_words {
-            let i = (start_word + offset) % self.num_words;
+        // Check starting word from start_bit onward
+        let first_word = unsafe { self.words.add(start_word).read() };
+        let masked = first_word & (u64::MAX << start_bit);
+        if masked != 0 {
+            let bit = masked.trailing_zeros() as usize;
+            let slot = start_word * 64 + bit;
+            if slot < self.num_slots {
+                unsafe {
+                    self.words.add(start_word).write(first_word & !(1u64 << bit));
+                }
+                self.free_count -= 1;
+                return Some(slot);
+            }
+        }
+
+        // Scan forward through remaining words (no modulo, use conditional wrap)
+        let mut i = start_word + 1;
+        if i >= self.num_words {
+            i = 0;
+        }
+
+        for _ in 1..self.num_words {
             let word = unsafe { self.words.add(i).read() };
             if word != 0 {
-                // Pick a random set bit from this word
-                let bit_count = word.count_ones() as u64;
-                let target = (random >> 16) % bit_count;
-                let bit = nth_set_bit(word, target as u32);
+                let bit = word.trailing_zeros() as usize;
                 let slot = i * 64 + bit;
                 if slot < self.num_slots {
                     unsafe {
@@ -109,10 +128,29 @@ impl SlabBitmap {
                     self.free_count -= 1;
                     return Some(slot);
                 }
-                // If slot >= num_slots due to partial last word, try first free
-                return self.alloc_first_free();
+            }
+            i += 1;
+            if i >= self.num_words {
+                i = 0;
             }
         }
+
+        // Check bits before start_bit in the starting word
+        if start_bit > 0 {
+            let pre = first_word & ((1u64 << start_bit) - 1);
+            if pre != 0 {
+                let bit = pre.trailing_zeros() as usize;
+                let slot = start_word * 64 + bit;
+                if slot < self.num_slots {
+                    unsafe {
+                        self.words.add(start_word).write(first_word & !(1u64 << bit));
+                    }
+                    self.free_count -= 1;
+                    return Some(slot);
+                }
+            }
+        }
+
         None
     }
 
@@ -138,22 +176,6 @@ impl SlabBitmap {
         let bit_idx = slot % 64;
         let word = unsafe { self.words.add(word_idx).read() };
         word & (1u64 << bit_idx) == 0
-    }
-}
-
-/// Find the position of the nth set bit (0-indexed) in a u64.
-#[cfg(feature = "slot-randomization")]
-fn nth_set_bit(mut word: u64, mut n: u32) -> usize {
-    loop {
-        if word == 0 {
-            return 0; // Shouldn't happen if n < popcount
-        }
-        let lowest = word.trailing_zeros();
-        if n == 0 {
-            return lowest as usize;
-        }
-        word &= !(1u64 << lowest);
-        n -= 1;
     }
 }
 
