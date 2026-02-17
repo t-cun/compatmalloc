@@ -1,31 +1,41 @@
 pub mod guard;
 
-use crate::hardening::metadata::{AllocationMeta, StripedMetadata};
+use crate::hardening::metadata::{AllocationMeta, MetadataTable};
 use crate::slab::page_map;
 use crate::sync::RawMutex;
+use crate::platform;
 use core::cell::UnsafeCell;
 use core::ptr;
 use guard::LargeAlloc;
 
-const MAX_LARGE_ALLOCS: usize = 4096;
+/// Hash table capacity for large allocations. Must be a power of two.
+const LARGE_TABLE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct LargeEntry {
-    alloc: Option<LargeEntryData>,
-}
-
-#[derive(Clone, Copy)]
-struct LargeEntryData {
+    /// Key: user_ptr as usize (0 = empty slot).
+    key: usize,
     base: *mut u8,
     total_size: usize,
-    user_ptr: *mut u8,
-    #[allow(dead_code)]
     data_size: usize,
     requested_size: usize,
 }
 
+impl LargeEntry {
+    const fn empty() -> Self {
+        LargeEntry {
+            key: 0,
+            base: ptr::null_mut(),
+            total_size: 0,
+            data_size: 0,
+            requested_size: 0,
+        }
+    }
+}
+
 struct LargeInner {
-    entries: [LargeEntry; MAX_LARGE_ALLOCS],
+    entries: [LargeEntry; LARGE_TABLE_CAPACITY],
+    count: usize,
 }
 
 pub struct LargeAllocator {
@@ -36,31 +46,45 @@ pub struct LargeAllocator {
 unsafe impl Send for LargeAllocator {}
 unsafe impl Sync for LargeAllocator {}
 
+/// Hash a pointer for the large allocation table.
+#[inline]
+fn hash_large_ptr(key: usize) -> usize {
+    // splitmix64 finalizer
+    let mut x = key as u64;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x as usize
+}
+
 impl LargeAllocator {
     pub const fn new() -> Self {
-        const EMPTY: LargeEntry = LargeEntry { alloc: None };
+        const EMPTY: LargeEntry = LargeEntry::empty();
         LargeAllocator {
             lock: RawMutex::new(),
             inner: UnsafeCell::new(LargeInner {
-                entries: [EMPTY; MAX_LARGE_ALLOCS],
+                entries: [EMPTY; LARGE_TABLE_CAPACITY],
+                count: 0,
             }),
         }
     }
 
-    pub unsafe fn alloc(&self, size: usize, metadata: &StripedMetadata) -> *mut u8 {
+    pub unsafe fn alloc(&self, size: usize, metadata: &MetadataTable) -> *mut u8 {
         let alloc = match LargeAlloc::create(size) {
             Some(a) => a,
             None => return ptr::null_mut(),
         };
 
-        let entry_data = LargeEntryData {
+        let user_ptr = alloc.user_ptr;
+        let entry = LargeEntry {
+            key: user_ptr as usize,
             base: alloc.base,
             total_size: alloc.total_size,
-            user_ptr: alloc.user_ptr,
             data_size: alloc.data_size,
             requested_size: alloc.requested_size,
         };
-        let user_ptr = alloc.user_ptr;
 
         #[cfg(feature = "canaries")]
         {
@@ -74,14 +98,7 @@ impl LargeAllocator {
 
         self.lock.lock();
         let inner = &mut *self.inner.get();
-        let mut stored = false;
-        for entry in inner.entries.iter_mut() {
-            if entry.alloc.is_none() {
-                entry.alloc = Some(entry_data);
-                stored = true;
-                break;
-            }
-        }
+        let stored = Self::insert_entry(inner, entry);
         self.lock.unlock();
 
         if !stored {
@@ -96,34 +113,45 @@ impl LargeAllocator {
         user_ptr
     }
 
-    pub unsafe fn free(&self, ptr: *mut u8, metadata: &StripedMetadata) -> bool {
+    pub unsafe fn free(&self, ptr: *mut u8, metadata: &MetadataTable) -> bool {
+        // Check metadata BEFORE acquiring large lock to match alloc's lock order
+        // (metadata lock -> large lock), preventing ABBA deadlock.
+        if let Some(meta) = metadata.get(ptr) {
+            if meta.is_freed() {
+                crate::hardening::abort_with_message(
+                    "compatmalloc: double free detected (large)\n",
+                );
+            }
+        }
+        metadata.remove(ptr);
+
         self.lock.lock();
         let inner = &mut *self.inner.get();
 
-        for entry in inner.entries.iter_mut() {
-            if let Some(ref data) = entry.alloc {
-                if data.user_ptr == ptr {
-                    if let Some(meta) = metadata.get(ptr) {
-                        if meta.is_freed() {
-                            self.lock.unlock();
-                            crate::hardening::abort_with_message(
-                                "compatmalloc: double free detected (large)\n",
-                            );
-                        }
-                    }
+        let key = ptr as usize;
+        let mask = LARGE_TABLE_CAPACITY - 1;
+        let mut idx = hash_large_ptr(key) & mask;
 
-                    metadata.remove(ptr);
-                    let base = data.base;
-                    let total_size = data.total_size;
-                    let data_size = data.data_size;
-                    entry.alloc = None;
-                    self.lock.unlock();
-                    // Unregister from page map before unmapping
-                    page_map::unregister_large(ptr, data_size);
-                    crate::platform::unmap(base, total_size);
-                    return true;
-                }
+        loop {
+            let entry = &inner.entries[idx];
+            if entry.key == key {
+                let base = entry.base;
+                let total_size = entry.total_size;
+                let data_size = entry.data_size;
+
+                // Remove entry and rehash
+                Self::remove_at(inner, idx);
+                self.lock.unlock();
+
+                // Unregister from page map before unmapping
+                page_map::unregister_large(ptr, data_size);
+                platform::unmap(base, total_size);
+                return true;
             }
+            if entry.key == 0 {
+                break;
+            }
+            idx = (idx + 1) & mask;
         }
         self.lock.unlock();
         false
@@ -132,47 +160,98 @@ impl LargeAllocator {
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> Option<usize> {
         self.lock.lock();
         let inner = &*self.inner.get();
-        for entry in &inner.entries {
-            if let Some(ref data) = entry.alloc {
-                if data.user_ptr == ptr {
-                    let size = data.requested_size;
-                    self.lock.unlock();
-                    return Some(size);
-                }
-            }
-        }
+        let result = Self::lookup_entry(inner, ptr).map(|e| e.requested_size);
         self.lock.unlock();
-        None
+        result
     }
 
     pub unsafe fn contains(&self, ptr: *mut u8) -> bool {
         self.lock.lock();
         let inner = &*self.inner.get();
-        for entry in &inner.entries {
-            if let Some(ref data) = entry.alloc {
-                if data.user_ptr == ptr {
-                    self.lock.unlock();
-                    return true;
-                }
-            }
-        }
+        let result = Self::lookup_entry(inner, ptr).is_some();
         self.lock.unlock();
-        false
+        result
     }
 
     pub unsafe fn requested_size(&self, ptr: *mut u8) -> Option<usize> {
         self.lock.lock();
         let inner = &*self.inner.get();
-        for entry in &inner.entries {
-            if let Some(ref data) = entry.alloc {
-                if data.user_ptr == ptr {
-                    let size = data.requested_size;
-                    self.lock.unlock();
-                    return Some(size);
-                }
-            }
-        }
+        let result = Self::lookup_entry(inner, ptr).map(|e| e.requested_size);
         self.lock.unlock();
-        None
+        result
+    }
+
+    // ========================================================================
+    // Hash table operations (caller must hold lock)
+    // ========================================================================
+
+    /// Insert an entry into the hash table. Returns false if table is full.
+    unsafe fn insert_entry(inner: &mut LargeInner, entry: LargeEntry) -> bool {
+        if inner.count >= LARGE_TABLE_CAPACITY * 3 / 4 {
+            return false; // Table too full
+        }
+        let mask = LARGE_TABLE_CAPACITY - 1;
+        let mut idx = hash_large_ptr(entry.key) & mask;
+        loop {
+            if inner.entries[idx].key == 0 {
+                inner.entries[idx] = entry;
+                inner.count += 1;
+                return true;
+            }
+            if inner.entries[idx].key == entry.key {
+                // Replace existing
+                inner.entries[idx] = entry;
+                return true;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    /// Look up an entry by user_ptr.
+    unsafe fn lookup_entry(inner: &LargeInner, ptr: *mut u8) -> Option<LargeEntry> {
+        let key = ptr as usize;
+        if key == 0 {
+            return None;
+        }
+        let mask = LARGE_TABLE_CAPACITY - 1;
+        let mut idx = hash_large_ptr(key) & mask;
+        loop {
+            let entry = &inner.entries[idx];
+            if entry.key == key {
+                return Some(*entry);
+            }
+            if entry.key == 0 {
+                return None;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    /// Remove entry at given index and rehash subsequent entries.
+    unsafe fn remove_at(inner: &mut LargeInner, idx: usize) {
+        let mask = LARGE_TABLE_CAPACITY - 1;
+        inner.entries[idx] = LargeEntry::empty();
+        inner.count -= 1;
+
+        // Backward shift deletion
+        let mut next = (idx + 1) & mask;
+        let mut vacancy = idx;
+        loop {
+            if inner.entries[next].key == 0 {
+                break;
+            }
+            let ideal = hash_large_ptr(inner.entries[next].key) & mask;
+            let should_move = if next > vacancy {
+                ideal <= vacancy || ideal > next
+            } else {
+                ideal <= vacancy && ideal > next
+            };
+            if should_move {
+                inner.entries[vacancy] = inner.entries[next];
+                inner.entries[next] = LargeEntry::empty();
+                vacancy = next;
+            }
+            next = (next + 1) & mask;
+        }
     }
 }

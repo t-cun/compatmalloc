@@ -85,19 +85,19 @@ fn realloc_null_acts_as_malloc() {
 }
 
 // ---------------------------------------------------------------------------
-// realloc(p, 0) == free(p), returns NULL
+// realloc(p, 0) returns a minimum-size allocation (not NULL, to prevent
+// use-after-free when callers interpret NULL as failure).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn realloc_to_zero_frees_and_returns_null() {
+fn realloc_to_zero_returns_minimum_allocation() {
     unsafe {
         let a = alloc();
         let p = a.malloc(64);
         assert!(!p.is_null());
         let q = a.realloc(p, 0);
-        assert!(q.is_null(), "realloc(p, 0) must return NULL");
-        // `p` has been freed; no double-free should happen here because we
-        // do NOT free p again.
+        assert!(!q.is_null(), "realloc(p, 0) must return a valid pointer");
+        a.free(q);
     }
 }
 

@@ -31,8 +31,17 @@ pub unsafe fn compatmalloc_init() {
     match INIT_STATE.compare_exchange(UNINIT, INITIALIZING, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {}
         Err(INITIALIZING) => {
+            // Bounded spin-wait with exponential backoff + yield fallback.
+            let mut spins = 0u32;
             while INIT_STATE.load(Ordering::Acquire) == INITIALIZING {
-                core::hint::spin_loop();
+                if spins < 100 {
+                    for _ in 0..(1 << spins.min(6)) {
+                        core::hint::spin_loop();
+                    }
+                } else {
+                    libc::sched_yield();
+                }
+                spins = spins.saturating_add(1);
             }
             return;
         }
@@ -49,6 +58,12 @@ pub unsafe fn compatmalloc_init() {
     if config::is_disabled() {
         INIT_STATE.store(DISABLED, Ordering::Release);
         return;
+    }
+
+    // Initialize canary secret from getrandom(2)
+    #[cfg(feature = "canaries")]
+    {
+        crate::hardening::canary::init_canary_secret();
     }
 
     // Initialize the hardened allocator

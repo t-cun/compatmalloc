@@ -66,11 +66,25 @@ static mut BOOTSTRAP_BUF: [u8; BOOTSTRAP_BUF_SIZE] = [0u8; BOOTSTRAP_BUF_SIZE];
 
 unsafe fn bootstrap_malloc(size: usize) -> *mut u8 {
     let aligned_size = (size + 15) & !15;
-    let offset = BOOTSTRAP_BUF_USED.fetch_add(aligned_size, Ordering::Relaxed);
-    if offset + aligned_size <= BOOTSTRAP_BUF_SIZE {
-        core::ptr::addr_of_mut!(BOOTSTRAP_BUF).cast::<u8>().add(offset)
-    } else {
-        ptr::null_mut()
+    // CAS loop to avoid permanently advancing the counter past buffer size.
+    loop {
+        let offset = BOOTSTRAP_BUF_USED.load(Ordering::Relaxed);
+        if offset + aligned_size > BOOTSTRAP_BUF_SIZE {
+            return ptr::null_mut();
+        }
+        if BOOTSTRAP_BUF_USED
+            .compare_exchange_weak(
+                offset,
+                offset + aligned_size,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return core::ptr::addr_of_mut!(BOOTSTRAP_BUF)
+                .cast::<u8>()
+                .add(offset);
+        }
     }
 }
 
@@ -112,7 +126,13 @@ pub unsafe fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
         // Can't realloc bootstrap memory, allocate new and copy
         let new = malloc(size);
         if !new.is_null() {
-            ptr::copy_nonoverlapping(ptr, new, size);
+            // Cap copy at the remaining bootstrap buffer from the old offset
+            // to avoid reading past the original allocation.
+            let base = core::ptr::addr_of!(BOOTSTRAP_BUF) as usize;
+            let old_offset = ptr as usize - base;
+            let max_old_size = BOOTSTRAP_BUF_SIZE - old_offset;
+            let copy_size = size.min(max_old_size);
+            ptr::copy_nonoverlapping(ptr, new, copy_size);
         }
         return new;
     }

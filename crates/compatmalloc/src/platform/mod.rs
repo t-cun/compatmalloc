@@ -71,18 +71,52 @@ pub fn thread_id() -> usize {
 }
 
 /// Get a fast, non-cryptographic random u64.
-/// Falls back to address-space randomization if no better source.
+/// Uses thread-local xorshift64* state to avoid global atomic contention.
 pub fn fast_random_u64() -> u64 {
-    // Use stack address as a simple entropy source mixed with a counter
-    static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let stack_addr = &count as *const _ as u64;
-    // Simple xorshift-style mixing
-    let mut x = stack_addr.wrapping_mul(0x517cc1b727220a95).wrapping_add(count);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51afd7ed558ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-    x ^= x >> 33;
+    use core::cell::Cell;
+
+    thread_local! {
+        static RNG_STATE: Cell<u64> = Cell::new(0);
+    }
+
+    // Try thread-local fast path
+    let result = RNG_STATE.try_with(|state| {
+        let mut s = state.get();
+        if s == 0 {
+            // Seed from stack address + thread id for uniqueness
+            let stack_addr = &s as *const _ as u64;
+            s = stack_addr
+                .wrapping_mul(0x517cc1b727220a95)
+                .wrapping_add(thread_id() as u64)
+                | 1; // ensure non-zero
+        }
+        // xorshift64*
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        state.set(s);
+        s.wrapping_mul(0x2545F4914F6CDD1D)
+    });
+
+    match result {
+        Ok(val) => val,
+        Err(_) => {
+            // TLS not available (early init or thread destruction) -- fallback
+            static COUNTER: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0);
+            let count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            splitmix64(count.wrapping_add(0x9E3779B97F4A7C15))
+        }
+    }
+}
+
+/// splitmix64 finalizer -- good hash for sequential inputs.
+#[inline]
+pub fn splitmix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
     x
 }

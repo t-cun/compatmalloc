@@ -59,10 +59,11 @@ impl RawMutex {
 
     #[inline]
     pub fn unlock(&self) {
-        let old = self.state.fetch_sub(1, Ordering::Release);
-        if old != 1 {
-            // There were waiters
-            self.state.store(0, Ordering::Release);
+        // Atomically set state to 0 (unlocked). If there were waiters (old == 2),
+        // wake one. Using swap instead of fetch_sub+store eliminates the race
+        // window where another thread could acquire-and-lose the lock.
+        let old = self.state.swap(0, Ordering::Release);
+        if old == 2 {
             self.wake_one();
         }
     }

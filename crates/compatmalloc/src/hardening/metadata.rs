@@ -46,17 +46,29 @@ struct MetaEntry {
     meta: AllocationMeta,
 }
 
-/// Mutable state for the metadata table, wrapped in UnsafeCell.
-struct MetadataInner {
+/// Mutable state for the metadata table.
+pub struct MetadataInner {
     entries: *mut MetaEntry,
     capacity: usize,
     count: usize,
     mapped_size: usize,
 }
 
+impl MetadataInner {
+    pub const fn new() -> Self {
+        MetadataInner {
+            entries: ptr::null_mut(),
+            capacity: 0,
+            count: 0,
+            mapped_size: 0,
+        }
+    }
+}
+
 /// Out-of-band metadata hash table.
 /// Uses open addressing with linear probing.
-/// Stored in a separate mmap region, never adjacent to user data.
+/// Cache-line aligned to prevent false sharing between stripes.
+#[repr(C, align(128))]
 pub struct MetadataTable {
     lock: RawMutex,
     inner: UnsafeCell<MetadataInner>,
@@ -71,19 +83,17 @@ impl MetadataTable {
     pub const fn new() -> Self {
         MetadataTable {
             lock: RawMutex::new(),
-            inner: UnsafeCell::new(MetadataInner {
-                entries: ptr::null_mut(),
-                capacity: 0,
-                count: 0,
-                mapped_size: 0,
-            }),
+            inner: UnsafeCell::new(MetadataInner::new()),
         }
     }
 
     /// Initialize the metadata table (must be called before use).
     pub unsafe fn init(&self) -> bool {
         let inner = &mut *self.inner.get();
-        let capacity = Self::INITIAL_CAPACITY;
+        Self::init_inner(inner, Self::INITIAL_CAPACITY)
+    }
+
+    unsafe fn init_inner(inner: &mut MetadataInner, capacity: usize) -> bool {
         let size = align_up(capacity * core::mem::size_of::<MetaEntry>(), PAGE_SIZE);
         let mem = platform::map_anonymous(size);
         if mem.is_null() {
@@ -96,9 +106,80 @@ impl MetadataTable {
         true
     }
 
+    // ========================================================================
+    // Locked methods (for standalone use, e.g. large allocator metadata)
+    // ========================================================================
+
     pub unsafe fn insert(&self, ptr: *mut u8, meta: AllocationMeta) {
         self.lock.lock();
         let inner = &mut *self.inner.get();
+        Self::insert_inner(inner, ptr, meta);
+        self.lock.unlock();
+    }
+
+    pub unsafe fn get(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        self.lock.lock();
+        let inner = &*self.inner.get();
+        let result = Self::get_inner(inner, ptr);
+        self.lock.unlock();
+        result
+    }
+
+    pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        self.lock.lock();
+        let inner = &*self.inner.get();
+        let result = Self::get_and_mark_freed_inner(inner, ptr);
+        self.lock.unlock();
+        result
+    }
+
+    pub unsafe fn remove(&self, ptr: *mut u8) {
+        self.lock.lock();
+        let inner = &mut *self.inner.get();
+        Self::remove_inner(inner, ptr);
+        self.lock.unlock();
+    }
+
+    // ========================================================================
+    // Unlocked methods (for use when caller holds an external lock, e.g. arena lock)
+    //
+    // # Safety
+    // Caller MUST hold the arena lock (or another external lock) that serializes
+    // access to the metadata table. These must not be called concurrently.
+    // ========================================================================
+
+    #[inline]
+    pub(crate) unsafe fn insert_unlocked(&self, ptr: *mut u8, meta: AllocationMeta) {
+        let inner = &mut *self.inner.get();
+        Self::insert_inner(inner, ptr, meta);
+    }
+
+    #[inline]
+    pub(crate) unsafe fn get_unlocked(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        let inner = &*self.inner.get();
+        Self::get_inner(inner, ptr)
+    }
+
+    #[inline]
+    pub(crate) unsafe fn get_and_mark_freed_unlocked(&self, ptr: *mut u8) -> Option<AllocationMeta> {
+        let inner = &*self.inner.get();
+        Self::get_and_mark_freed_inner(inner, ptr)
+    }
+
+    #[inline]
+    pub(crate) unsafe fn remove_unlocked(&self, ptr: *mut u8) {
+        let inner = &mut *self.inner.get();
+        Self::remove_inner(inner, ptr);
+    }
+
+    // ========================================================================
+    // Inner implementations (no locking)
+    // ========================================================================
+
+    unsafe fn insert_inner(inner: &mut MetadataInner, ptr: *mut u8, meta: AllocationMeta) {
+        if inner.entries.is_null() || inner.capacity == 0 {
+            return;
+        }
         // Grow if load factor > 75%
         if inner.count * 4 >= inner.capacity * 3 {
             Self::grow(inner);
@@ -115,18 +196,14 @@ impl MetadataTable {
                 }
                 entry.key = key;
                 entry.meta = meta;
-                self.lock.unlock();
                 return;
             }
             idx = (idx + 1) & mask;
         }
     }
 
-    pub unsafe fn get(&self, ptr: *mut u8) -> Option<AllocationMeta> {
-        self.lock.lock();
-        let inner = &*self.inner.get();
+    unsafe fn get_inner(inner: &MetadataInner, ptr: *mut u8) -> Option<AllocationMeta> {
         if inner.entries.is_null() || inner.capacity == 0 {
-            self.lock.unlock();
             return None;
         }
         let key = ptr as usize;
@@ -135,46 +212,20 @@ impl MetadataTable {
         loop {
             let entry = &*inner.entries.add(idx);
             if entry.key == key {
-                let result = Some(entry.meta);
-                self.lock.unlock();
-                return result;
+                return Some(entry.meta);
             }
             if entry.key == 0 {
-                self.lock.unlock();
                 return None;
             }
             idx = (idx + 1) & mask;
         }
     }
 
-    pub unsafe fn mark_freed(&self, ptr: *mut u8) {
-        self.lock.lock();
-        let inner = &*self.inner.get();
-        let key = ptr as usize;
-        let mask = inner.capacity - 1;
-        let mut idx = hash_ptr(key) & mask;
-        loop {
-            let entry = &mut *inner.entries.add(idx);
-            if entry.key == key {
-                entry.meta.mark_freed();
-                self.lock.unlock();
-                return;
-            }
-            if entry.key == 0 {
-                self.lock.unlock();
-                return;
-            }
-            idx = (idx + 1) & mask;
-        }
-    }
-
-    /// Combined get + mark_freed in a single lock acquisition.
-    /// Returns the metadata before marking as freed.
-    pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
-        self.lock.lock();
-        let inner = &*self.inner.get();
+    unsafe fn get_and_mark_freed_inner(
+        inner: &MetadataInner,
+        ptr: *mut u8,
+    ) -> Option<AllocationMeta> {
         if inner.entries.is_null() || inner.capacity == 0 {
-            self.lock.unlock();
             return None;
         }
         let key = ptr as usize;
@@ -185,20 +236,19 @@ impl MetadataTable {
             if entry.key == key {
                 let result = entry.meta;
                 entry.meta.mark_freed();
-                self.lock.unlock();
                 return Some(result);
             }
             if entry.key == 0 {
-                self.lock.unlock();
                 return None;
             }
             idx = (idx + 1) & mask;
         }
     }
 
-    pub unsafe fn remove(&self, ptr: *mut u8) {
-        self.lock.lock();
-        let inner = &mut *self.inner.get();
+    unsafe fn remove_inner(inner: &mut MetadataInner, ptr: *mut u8) {
+        if inner.entries.is_null() || inner.capacity == 0 {
+            return;
+        }
         let key = ptr as usize;
         let mask = inner.capacity - 1;
         let mut idx = hash_ptr(key) & mask;
@@ -217,11 +267,9 @@ impl MetadataTable {
                         break;
                     }
                     let ideal = hash_ptr(next_entry.key) & mask;
-                    // Check if this entry needs to move back
                     let should_move = if next > idx {
                         ideal <= idx || ideal > next
                     } else {
-                        // Wrapped around
                         ideal <= idx && ideal > next
                     };
                     if should_move {
@@ -233,17 +281,17 @@ impl MetadataTable {
                     }
                     next = (next + 1) & mask;
                 }
-                self.lock.unlock();
                 return;
             }
             if entry.key == 0 {
-                self.lock.unlock();
                 return;
             }
             idx = (idx + 1) & mask;
         }
     }
 
+    /// Grow the hash table. Allocates new table outside the critical section concept,
+    /// then rehashes entries.
     unsafe fn grow(inner: &mut MetadataInner) {
         let new_capacity = inner.capacity * 2;
         let new_size = align_up(new_capacity * core::mem::size_of::<MetaEntry>(), PAGE_SIZE);
@@ -285,66 +333,14 @@ impl MetadataTable {
     }
 }
 
+/// splitmix64 finalizer for proper distribution of pointer keys.
 #[inline]
 fn hash_ptr(key: usize) -> usize {
-    let k = key as u64;
-    let h = k.wrapping_mul(0x9E3779B97F4A7C15);
-    (h >> 32) as usize ^ h as usize
-}
-
-// ============================================================================
-// Striped metadata: distributes entries across N tables to reduce contention
-// ============================================================================
-
-const NUM_META_STRIPES: usize = 8;
-
-/// Striped metadata table: distributes operations across N sub-tables
-/// based on the pointer address, reducing lock contention by N×.
-pub struct StripedMetadata {
-    tables: [MetadataTable; NUM_META_STRIPES],
-}
-
-impl StripedMetadata {
-    pub const fn new() -> Self {
-        const TABLE: MetadataTable = MetadataTable::new();
-        StripedMetadata {
-            tables: [TABLE; NUM_META_STRIPES],
-        }
-    }
-
-    #[inline]
-    fn stripe_for(&self, ptr: *mut u8) -> &MetadataTable {
-        // Use upper bits of page number for stripe selection
-        let idx = ((ptr as usize) >> 12) % NUM_META_STRIPES;
-        &self.tables[idx]
-    }
-
-    pub unsafe fn init(&self) -> bool {
-        for table in &self.tables {
-            if !table.init() {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub unsafe fn insert(&self, ptr: *mut u8, meta: AllocationMeta) {
-        self.stripe_for(ptr).insert(ptr, meta);
-    }
-
-    pub unsafe fn get(&self, ptr: *mut u8) -> Option<AllocationMeta> {
-        self.stripe_for(ptr).get(ptr)
-    }
-
-    pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
-        self.stripe_for(ptr).get_and_mark_freed(ptr)
-    }
-
-    pub unsafe fn mark_freed(&self, ptr: *mut u8) {
-        self.stripe_for(ptr).mark_freed(ptr);
-    }
-
-    pub unsafe fn remove(&self, ptr: *mut u8) {
-        self.stripe_for(ptr).remove(ptr);
-    }
+    let mut x = key as u64;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x as usize
 }

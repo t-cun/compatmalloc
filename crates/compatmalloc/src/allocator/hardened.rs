@@ -1,8 +1,9 @@
-use crate::hardening::metadata::StripedMetadata;
+use crate::hardening::metadata::MetadataTable;
 use crate::large::LargeAllocator;
 use crate::slab::page_map;
+use crate::slab::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES};
 use crate::slab::{size_class_index, Arena};
-use crate::util::{align_up, MAX_ARENAS, MIN_ALIGN};
+use crate::util::{MAX_ARENAS, MIN_ALIGN};
 use crate::{config, platform};
 use core::ptr;
 
@@ -11,9 +12,8 @@ pub struct HardenedAllocator {
     arenas: [Arena; MAX_ARENAS],
     num_arenas: usize,
     large: LargeAllocator,
-    pub metadata: StripedMetadata,
-    #[cfg(feature = "quarantine")]
-    pub quarantine: crate::hardening::quarantine::Quarantine,
+    /// Metadata table for large allocations only (not per-arena).
+    large_metadata: MetadataTable,
 }
 
 unsafe impl Send for HardenedAllocator {}
@@ -26,9 +26,7 @@ impl HardenedAllocator {
             arenas: [ARENA; MAX_ARENAS],
             num_arenas: 1,
             large: LargeAllocator::new(),
-            metadata: StripedMetadata::new(),
-            #[cfg(feature = "quarantine")]
-            quarantine: crate::hardening::quarantine::Quarantine::new(),
+            large_metadata: MetadataTable::new(),
         }
     }
 
@@ -48,33 +46,40 @@ impl HardenedAllocator {
             cpus.min(MAX_ARENAS).max(1)
         };
 
-        // Set arena indices for page map registration
+        // Set arena indices and init per-arena metadata
         for i in 0..self.num_arenas {
             self.arenas[i].set_arena_index(i);
+            if !self.arenas[i].init_metadata() {
+                return false;
+            }
         }
 
-        // Initialize metadata table
-        if !self.metadata.init() {
+        // Initialize large-allocation metadata table
+        if !self.large_metadata.init() {
             return false;
         }
 
-        // Configure quarantine
+        // Configure per-arena quarantine
         #[cfg(feature = "quarantine")]
         {
             let qsize = config::quarantine_bytes();
             if qsize > 0 {
-                self.quarantine.set_max_bytes(qsize);
+                let per_arena = qsize / self.num_arenas;
+                let per_arena = if per_arena == 0 { 1 } else { per_arena };
+                for i in 0..self.num_arenas {
+                    self.arenas[i].set_quarantine_max_bytes(per_arena);
+                }
             }
         }
 
         true
     }
 
-    /// Select an arena for the current thread.
+    /// Select an arena for the current thread using splitmix64(tid).
     #[inline]
     fn select_arena(&self) -> &Arena {
         let tid = platform::thread_id();
-        let idx = tid % self.num_arenas;
+        let idx = platform::splitmix64(tid as u64) as usize % self.num_arenas;
         &self.arenas[idx]
     }
 
@@ -90,11 +95,11 @@ impl HardenedAllocator {
                     return ptr;
                 }
                 let arena = self.select_arena();
-                arena.alloc(alloc_size, class_idx, &self.metadata)
+                arena.alloc(alloc_size, class_idx)
             }
             None => {
                 // Large allocation
-                self.large.alloc(alloc_size, &self.metadata)
+                self.large.alloc(alloc_size, &self.large_metadata)
             }
         }
     }
@@ -108,7 +113,16 @@ impl HardenedAllocator {
         thread_cache::with_thread_cache(|cache| {
             // Fast path: pop from cache
             if let Some(cached) = cache.pop(class_idx) {
-                return Some(self.setup_cached_alloc(cached.ptr, size, class_idx));
+                let arena_idx = cached.arena_index;
+                if arena_idx < self.num_arenas {
+                    self.arenas[arena_idx].setup_cached_alloc_metadata(
+                        cached.ptr,
+                        size,
+                        class_idx,
+                    );
+                    return Some(cached.ptr);
+                }
+                // Invalid arena index -- skip this slot, fall through to batch fill
             }
 
             // Cache miss: batch-fill from arena
@@ -118,6 +132,7 @@ impl HardenedAllocator {
                 slab_ptr: core::ptr::null_mut(),
                 slot_index: 0,
                 class_index: 0,
+                arena_index: 0,
             }; BATCH_SIZE];
 
             let arena = self.select_arena();
@@ -126,39 +141,23 @@ impl HardenedAllocator {
                 return None;
             }
 
-            // First slot goes to the caller, rest to the cache
-            let result = self.setup_cached_alloc(buf[0].ptr, size, class_idx);
+            // First slot goes to the caller with metadata set up
+            let first = buf[0];
+            if first.arena_index >= self.num_arenas {
+                return None;
+            }
+            self.arenas[first.arena_index].setup_cached_alloc_metadata(
+                first.ptr,
+                size,
+                class_idx,
+            );
+
+            // Rest go to the cache (metadata set up later when popped)
             for i in 1..n {
                 cache.push(class_idx, buf[i]);
             }
-            Some(result)
+            Some(first.ptr)
         })?
-    }
-
-    /// Set up metadata for a cached allocation slot.
-    #[inline]
-    unsafe fn setup_cached_alloc(&self, ptr: *mut u8, size: usize, class_idx: usize) -> *mut u8 {
-        let slot_sz = crate::slab::size_class::slot_size(class_idx);
-
-        #[cfg(feature = "canaries")]
-        {
-            let canary = crate::hardening::canary::generate_canary(ptr);
-            crate::hardening::canary::write_canary(ptr, size, slot_sz, canary);
-            self.metadata.insert(
-                ptr,
-                crate::hardening::metadata::AllocationMeta::new(size, canary),
-            );
-        }
-        #[cfg(not(feature = "canaries"))]
-        {
-            let _ = slot_sz;
-            self.metadata.insert(
-                ptr,
-                crate::hardening::metadata::AllocationMeta::new(size, 0),
-            );
-        }
-
-        ptr
     }
 
     /// Free memory.
@@ -170,39 +169,73 @@ impl HardenedAllocator {
         // Use page map for O(1) dispatch
         if let Some(info) = page_map::lookup(ptr) {
             if info.is_large() {
-                self.large.free(ptr, &self.metadata);
+                self.large.free(ptr, &self.large_metadata);
                 return;
             }
-            // Slab allocation: dispatch to the correct arena directly
+            // Slab allocation: dispatch to correct arena
             let arena_idx = info.arena_index as usize;
+
             if arena_idx < self.num_arenas {
-                self.arenas[arena_idx].free_direct(
-                    info.slab_ptr,
-                    ptr,
-                    &self.metadata,
-                    #[cfg(feature = "quarantine")]
-                    &self.quarantine,
-                );
+                // Direct free to arena (single lock covers metadata + quarantine + bitmap)
+                self.arenas[arena_idx].free_direct(info.slab_ptr, ptr);
                 return;
             }
         }
 
         // Fallback: try large allocator then scan arenas
         if self.large.contains(ptr) {
-            self.large.free(ptr, &self.metadata);
+            self.large.free(ptr, &self.large_metadata);
             return;
         }
 
         for i in 0..self.num_arenas {
-            if self.arenas[i].free(
-                ptr,
-                &self.metadata,
-                #[cfg(feature = "quarantine")]
-                &self.quarantine,
-            ) {
+            if self.arenas[i].free(ptr) {
                 return;
             }
         }
+    }
+
+    /// Try to defer a free to the thread-local free buffer.
+    /// Returns true if the free was deferred (or flushed).
+    /// Currently unused: deferred frees delay security checks (canary, poison, double-free).
+    /// Kept as infrastructure for future optimization with immediate security pre-checks.
+    #[allow(dead_code)]
+    #[inline]
+    unsafe fn try_cache_free(
+        &self,
+        ptr: *mut u8,
+        slab_ptr: *mut u8,
+        class_idx: usize,
+        arena_idx: usize,
+    ) -> bool {
+        use crate::allocator::thread_cache::{self, CachedSlot};
+
+        let slot_index = {
+            let slab = &*(slab_ptr as *mut crate::slab::arena::Slab);
+            match slab.slot_for_ptr(ptr) {
+                Some(s) => s,
+                None => return false,
+            }
+        };
+
+        let cached = CachedSlot {
+            ptr,
+            slab_ptr,
+            slot_index,
+            class_index: class_idx,
+            arena_index: arena_idx,
+        };
+
+        let result = thread_cache::with_thread_cache(|cache| {
+            if cache.free_is_full(class_idx) {
+                // Flush the full buffer to arena, then push this one
+                let (buf, count) = cache.drain_frees(class_idx);
+                self.arenas[arena_idx].free_batch_deferred(&buf, count);
+            }
+            cache.push_free(class_idx, cached)
+        });
+
+        matches!(result, Some(true))
     }
 
     /// Reallocate memory.
@@ -211,45 +244,42 @@ impl HardenedAllocator {
             return self.malloc(new_size);
         }
 
-        if new_size == 0 {
-            self.free(ptr);
-            return ptr::null_mut();
-        }
+        // realloc(ptr, 0) is implementation-defined. Treat as realloc(ptr, 1)
+        // to avoid returning NULL (which callers interpret as failure, leading to
+        // use-after-free of the old pointer).
+        let new_size = if new_size == 0 { 1 } else { new_size };
 
-        // Get old size from metadata
-        let old_size = if let Some(meta) = self.metadata.get(ptr) {
-            meta.requested_size
-        } else if let Some(sz) = self.large.requested_size(ptr) {
-            sz
-        } else {
-            // Unknown pointer -- try usable size
-            self.usable_size(ptr)
-        };
+        // Get old size from metadata (check per-arena, then large)
+        let old_size = self.get_requested_size(ptr);
 
         // If the new size fits in the same slot, just update metadata
         if new_size <= old_size {
-            // For slab allocations, check if it fits in the same size class
             if let Some(old_class) = size_class_index(old_size) {
                 if let Some(new_class) = size_class_index(new_size) {
                     if old_class == new_class {
-                        // Update metadata
+                        // Verify old canary before overwriting
                         #[cfg(feature = "canaries")]
                         {
-                            let slot_sz = crate::slab::size_class::slot_size(old_class);
-                            let canary = crate::hardening::canary::generate_canary(ptr);
-                            crate::hardening::canary::write_canary(ptr, new_size, slot_sz, canary);
-                            self.metadata.insert(
-                                ptr,
-                                crate::hardening::metadata::AllocationMeta::new(new_size, canary),
-                            );
+                            if let Some(info) = page_map::lookup(ptr) {
+                                if !info.is_large() {
+                                    let arena_idx = info.arena_index as usize;
+                                    if arena_idx < self.num_arenas {
+                                        if let Some(meta) = self.arenas[arena_idx].get_metadata(ptr) {
+                                            let slot_sz = crate::slab::size_class::slot_size(old_class);
+                                            if !crate::hardening::canary::check_canary(
+                                                ptr, meta.requested_size, slot_sz, meta.canary_value,
+                                            ) {
+                                                crate::hardening::abort_with_message(
+                                                    "compatmalloc: heap buffer overflow detected (canary corrupted in realloc)\n",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        #[cfg(not(feature = "canaries"))]
-                        {
-                            self.metadata.insert(
-                                ptr,
-                                crate::hardening::metadata::AllocationMeta::new(new_size, 0),
-                            );
-                        }
+                        // Update metadata in the correct arena
+                        self.update_metadata_for_realloc(ptr, new_size, old_class);
                         return ptr;
                     }
                 }
@@ -269,13 +299,53 @@ impl HardenedAllocator {
         new_ptr
     }
 
+    /// Get the requested size for a pointer (checks arena metadata and large allocator).
+    unsafe fn get_requested_size(&self, ptr: *mut u8) -> usize {
+        if let Some(info) = page_map::lookup(ptr) {
+            if info.is_large() {
+                if let Some(meta) = self.large_metadata.get(ptr) {
+                    return meta.requested_size;
+                }
+                if let Some(sz) = self.large.requested_size(ptr) {
+                    return sz;
+                }
+            } else {
+                let arena_idx = info.arena_index as usize;
+                if arena_idx < self.num_arenas {
+                    if let Some(meta) = self.arenas[arena_idx].get_metadata(ptr) {
+                        return meta.requested_size;
+                    }
+                }
+            }
+        }
+        self.usable_size(ptr)
+    }
+
+    /// Update metadata for in-place realloc (same size class).
+    unsafe fn update_metadata_for_realloc(
+        &self,
+        ptr: *mut u8,
+        new_size: usize,
+        class_idx: usize,
+    ) {
+        if let Some(info) = page_map::lookup(ptr) {
+            if !info.is_large() {
+                let arena_idx = info.arena_index as usize;
+                if arena_idx < self.num_arenas {
+                    self.arenas[arena_idx].setup_cached_alloc_metadata(
+                        ptr, new_size, class_idx,
+                    );
+                }
+            }
+        }
+    }
+
     /// Calloc: allocate zeroed memory.
     pub unsafe fn calloc(&self, nmemb: usize, size: usize) -> *mut u8 {
         // Check for overflow
         let total = match nmemb.checked_mul(size) {
             Some(t) => t,
             None => {
-                // Set errno to ENOMEM
                 *libc::__errno_location() = libc::ENOMEM;
                 return ptr::null_mut();
             }
@@ -283,9 +353,27 @@ impl HardenedAllocator {
 
         let ptr = self.malloc(total);
         if !ptr.is_null() {
-            // Zero the memory (mmap gives us zeroed pages, but slab slots
-            // may have been recycled, so we must zero explicitly)
-            ptr::write_bytes(ptr, 0, total);
+            // Optimization: skip zeroing for fresh mmap pages that haven't been freed.
+            let needs_zeroing = if let Some(info) = page_map::lookup(ptr) {
+                if info.is_large() {
+                    // Large allocations are always fresh mmap pages
+                    false
+                } else {
+                    // Check if the slab has ever had slots freed
+                    let arena_idx = info.arena_index as usize;
+                    if arena_idx < self.num_arenas {
+                        self.arenas[arena_idx].slab_ever_freed(info.slab_ptr)
+                    } else {
+                        true
+                    }
+                }
+            } else {
+                true
+            };
+
+            if needs_zeroing {
+                ptr::write_bytes(ptr, 0, total);
+            }
         }
         ptr
     }
@@ -332,43 +420,52 @@ impl HardenedAllocator {
             return self.malloc(size);
         }
 
-        // For larger alignments, we over-allocate and return an aligned address.
-        // This is simple but wastes some memory. For a production allocator,
-        // we'd have dedicated aligned slabs.
-        let padded = size + alignment;
-        let raw = self.malloc(padded);
-        if raw.is_null() {
-            return ptr::null_mut();
+        let alloc_size = if size == 0 { 1 } else { size };
+
+        // Find a size class where slot_size >= alloc_size AND slot_size is a multiple
+        // of alignment. This ensures all slots are naturally aligned since slab data
+        // starts at a page-aligned boundary.
+        if let Some(class_idx) = Self::find_aligned_size_class(alloc_size, alignment) {
+            // Use the regular allocation path with this class
+            if let Some(ptr) = self.try_cache_alloc(alloc_size, class_idx) {
+                return ptr;
+            }
+            let arena = self.select_arena();
+            return arena.alloc(alloc_size, class_idx);
         }
 
-        let aligned = align_up(raw as usize, alignment) as *mut u8;
-        if aligned != raw {
-            // Store the original pointer just before the aligned pointer
-            // so we can find it on free. We store it in metadata.
-            // For now, we just return the aligned pointer and track it in metadata.
-            // The arena will find it by checking slab containment.
-            //
-            // Note: this approach works because arena.free checks slab containment
-            // by range, so aligned pointers within a slab are still found.
-            // However, we need to update metadata to point to the aligned address.
-            self.metadata.remove(raw);
-            #[cfg(feature = "canaries")]
-            {
-                let canary = crate::hardening::canary::generate_canary(aligned);
-                self.metadata.insert(
-                    aligned,
-                    crate::hardening::metadata::AllocationMeta::new(size, canary),
-                );
+        // No suitable slab class: use large allocator (page-aligned via mmap).
+        // mmap guarantees PAGE_SIZE alignment; for larger alignments, the caller
+        // would need a specialized path, but in practice alignments > PAGE_SIZE
+        // are extremely rare and mmap addresses are often naturally over-aligned.
+        self.large.alloc(alloc_size, &self.large_metadata)
+    }
+
+    /// Get metadata for a pointer (for testing/debugging). Routes to correct arena or large.
+    pub unsafe fn get_metadata(
+        &self,
+        ptr: *mut u8,
+    ) -> Option<crate::hardening::metadata::AllocationMeta> {
+        if let Some(info) = page_map::lookup(ptr) {
+            if info.is_large() {
+                return self.large_metadata.get(ptr);
             }
-            #[cfg(not(feature = "canaries"))]
-            {
-                self.metadata.insert(
-                    aligned,
-                    crate::hardening::metadata::AllocationMeta::new(size, 0),
-                );
+            let arena_idx = info.arena_index as usize;
+            if arena_idx < self.num_arenas {
+                return self.arenas[arena_idx].get_metadata(ptr);
             }
         }
+        None
+    }
 
-        aligned
+    /// Find the smallest size class where slot_size >= size AND slot_size % alignment == 0.
+    fn find_aligned_size_class(size: usize, alignment: usize) -> Option<usize> {
+        for i in 0..NUM_SIZE_CLASSES {
+            let ss = SIZE_CLASSES[i];
+            if ss >= size && ss % alignment == 0 {
+                return Some(i);
+            }
+        }
+        None
     }
 }

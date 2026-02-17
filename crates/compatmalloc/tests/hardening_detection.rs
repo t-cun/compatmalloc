@@ -276,7 +276,7 @@ fn metadata_tracks_freed_state() {
         assert!(!p.is_null());
 
         // Before free: metadata should exist and not be marked freed.
-        let meta_before = a.metadata.get(p);
+        let meta_before = a.get_metadata(p);
         assert!(
             meta_before.is_some(),
             "metadata should exist for a live allocation"
@@ -292,7 +292,7 @@ fn metadata_tracks_freed_state() {
         // or removed (if no quarantine).
         #[cfg(feature = "quarantine")]
         {
-            let meta_after = a.metadata.get(p);
+            let meta_after = a.get_metadata(p);
             // With quarantine, metadata is marked freed but not removed until
             // the slot is recycled.
             if let Some(m) = meta_after {
@@ -317,7 +317,7 @@ fn metadata_records_requested_size() {
             let p = a.malloc(size);
             assert!(!p.is_null());
 
-            let meta = a.metadata.get(p);
+            let meta = a.get_metadata(p);
             assert!(meta.is_some(), "metadata missing for malloc({})", size);
             assert_eq!(
                 meta.unwrap().requested_size,

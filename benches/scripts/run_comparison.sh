@@ -44,9 +44,9 @@ run_bench() {
     echo "--- $name ---"
     local output
     if [ -n "$preload" ]; then
-        output=$(ALLOCATOR_NAME="$name" $env_extra LD_PRELOAD="$preload" "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+        output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; LD_PRELOAD="$preload" "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
     else
-        output=$(ALLOCATOR_NAME="$name" $env_extra "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+        output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
     fi
     echo "$output"
     echo ""
