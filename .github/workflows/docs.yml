@@ -1,11 +1,10 @@
 name: Documentation
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Benchmarks"]
+    types: [completed]
     branches: [main]
-    paths:
-      - "docs/**"
-      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -23,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Install mdBook
         run: |
