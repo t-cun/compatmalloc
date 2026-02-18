@@ -107,12 +107,14 @@ pub unsafe fn allocator() -> &'static HardenedAllocator {
     &*ALLOCATOR.0.get()
 }
 
-/// Check init state. Uses Relaxed ordering: on x86 all loads are naturally
-/// ordered, and the init state is set once during init (which happens-before
-/// any allocation via the constructor/ensure_initialized path).
+/// Check init state. Uses Acquire ordering to pair with the Release store
+/// at end of init, ensuring all init side-effects (page map, canary secret,
+/// config, TLS) are visible to any thread that observes READY/DISABLED.
+/// On x86 this compiles to a plain `mov` (zero cost); on ARM64 it emits
+/// `ldar` which is required for correctness.
 #[inline(always)]
 pub fn state() -> u8 {
-    INIT_STATE.load(Ordering::Relaxed)
+    INIT_STATE.load(Ordering::Acquire)
 }
 
 pub const STATE_READY: u8 = READY;

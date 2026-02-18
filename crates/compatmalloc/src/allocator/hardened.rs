@@ -309,7 +309,7 @@ impl HardenedAllocator {
                         if align == MIN_ALIGN {
                             let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
                             let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
-                            if meta.requested_size == size as u32 {
+                            if meta.requested_size.get() == size as u32 {
                                 meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
                                 return Some(cached.ptr);
                             }
@@ -465,7 +465,7 @@ impl HardenedAllocator {
         // Hot path (fast_reg empty after malloc pop): write fields directly
         // to fast_reg without intermediate stack copy. Cold path (eviction
         // needed): build CachedSlot and call cold function.
-        let cached_size = meta.requested_size;
+        let cached_size = meta.requested_size.get();
         if s.fast_reg.ptr.is_null() {
             s.fast_reg.ptr = ptr;
             s.fast_reg.slab_ptr = slab_ptr;
@@ -600,9 +600,9 @@ impl HardenedAllocator {
                 meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
             if !crate::hardening::integrity::verify_checksum(
                 slot_base as usize,
-                meta.requested_size,
+                meta.requested_size.get(),
                 flags_masked,
-                meta.checksum,
+                meta.checksum.get(),
             ) {
                 crate::hardening::abort_with_message(
                     "compatmalloc: metadata integrity check failed\n",
@@ -617,7 +617,7 @@ impl HardenedAllocator {
                     && !crate::hardening::canary::check_canary_front(
                         slot_base,
                         front_gap,
-                        meta.checksum,
+                        meta.checksum.get(),
                     )
                 {
                     crate::hardening::abort_with_message(
@@ -625,13 +625,13 @@ impl HardenedAllocator {
                     );
                 }
                 let effective_slot_sz = slot_sz - front_gap;
-                let req_sz = meta.requested_size as usize;
+                let req_sz = meta.requested_size.get() as usize;
                 if req_sz < effective_slot_sz
                     && !crate::hardening::canary::check_canary(
                         user_ptr,
                         req_sz,
                         effective_slot_sz,
-                        meta.checksum,
+                        meta.checksum.get(),
                     )
                 {
                     crate::hardening::abort_with_message(
@@ -678,9 +678,9 @@ impl HardenedAllocator {
             meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
         if !crate::hardening::integrity::verify_checksum(
             slot_base as usize,
-            meta.requested_size,
+            meta.requested_size.get(),
             flags_masked,
-            meta.checksum,
+            meta.checksum.get(),
         ) {
             crate::hardening::abort_with_message(
                 "compatmalloc: metadata integrity check failed\n",
@@ -695,7 +695,7 @@ impl HardenedAllocator {
                 && !crate::hardening::canary::check_canary_front(
                     slot_base,
                     front_gap,
-                    meta.checksum,
+                    meta.checksum.get(),
                 )
             {
                 crate::hardening::abort_with_message(
@@ -703,13 +703,13 @@ impl HardenedAllocator {
                 );
             }
             let effective_slot_sz = slot_sz - front_gap;
-            let req_sz = meta.requested_size as usize;
+            let req_sz = meta.requested_size.get() as usize;
             if req_sz < effective_slot_sz
                 && !crate::hardening::canary::check_canary(
                     user_ptr,
                     req_sz,
                     effective_slot_sz,
-                    meta.checksum,
+                    meta.checksum.get(),
                 )
             {
                 crate::hardening::abort_with_message(
@@ -767,9 +767,9 @@ impl HardenedAllocator {
                                     let slot_meta = slab.get_slot_meta(slot_idx);
                                     if !crate::hardening::integrity::verify_checksum(
                                         slot_base as usize,
-                                        slot_meta.requested_size,
+                                        slot_meta.requested_size.get(),
                                         slot_meta.flags.load(core::sync::atomic::Ordering::Relaxed),
-                                        slot_meta.checksum,
+                                        slot_meta.checksum.get(),
                                     ) {
                                         crate::hardening::abort_with_message(
                                             "compatmalloc: metadata integrity check failed in realloc\n",
@@ -784,7 +784,7 @@ impl HardenedAllocator {
                                             && !crate::hardening::canary::check_canary_front(
                                                 slot_base,
                                                 front_gap,
-                                                slot_meta.checksum,
+                                                slot_meta.checksum.get(),
                                             )
                                         {
                                             crate::hardening::abort_with_message(
@@ -792,13 +792,13 @@ impl HardenedAllocator {
                                             );
                                         }
                                         let effective_slot_sz = slot_sz - front_gap;
-                                        let req_sz = slot_meta.requested_size as usize;
+                                        let req_sz = slot_meta.requested_size.get() as usize;
                                         if req_sz < effective_slot_sz
                                             && !crate::hardening::canary::check_canary(
                                                 ptr,
                                                 req_sz,
                                                 effective_slot_sz,
-                                                slot_meta.checksum,
+                                                slot_meta.checksum.get(),
                                             )
                                         {
                                             crate::hardening::abort_with_message(

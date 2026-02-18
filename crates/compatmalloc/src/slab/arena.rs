@@ -5,7 +5,7 @@ use crate::slab::page_map;
 use crate::slab::size_class::{self, NUM_SIZE_CLASSES};
 use crate::sync::RawMutex;
 use crate::util::align_up;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,11 +14,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Field order optimized: u64 first to avoid alignment padding (16 bytes vs 24).
 ///
 /// The `flags` field uses AtomicU8 for race-free double-free detection via CAS.
-/// All other fields are non-atomic (protected by bitmap ownership invariant).
+/// `checksum` and `requested_size` use `Cell` for interior mutability (written
+/// through `&self` when bitmap ownership guarantees exclusive access). `Cell`
+/// compiles to plain loads/stores — zero overhead vs raw field access.
 #[repr(C)]
 pub struct SlotMeta {
-    pub checksum: u64,
-    pub requested_size: u32,
+    pub checksum: Cell<u64>,
+    pub requested_size: Cell<u32>,
     pub flags: core::sync::atomic::AtomicU8,
     _pad: [u8; 3],
 }
@@ -28,8 +30,8 @@ const SLOT_META_FLAG_FREED: u8 = 0x01;
 impl SlotMeta {
     pub const fn empty() -> Self {
         SlotMeta {
-            requested_size: 0,
-            checksum: 0,
+            requested_size: Cell::new(0),
+            checksum: Cell::new(0),
             flags: core::sync::atomic::AtomicU8::new(0),
             _pad: [0; 3],
         }
@@ -50,41 +52,42 @@ impl SlotMeta {
         old & SLOT_META_FLAG_FREED == 0
     }
 
-    /// Non-atomic mark-freed for the TLS hot path where single-writer is
-    /// guaranteed by thread-cache ownership. Avoids `lock cmpxchg` (~10-15
-    /// cycles) in favor of plain `mov` + `test` + `mov` (~3 cycles).
+    /// Relaxed-atomic mark-freed for the TLS hot path where single-writer is
+    /// guaranteed by thread-cache ownership. Uses Relaxed ordering (not a CAS)
+    /// so the compiler emits plain `movzbl` + `test` + `movb` on x86 — same
+    /// codegen as non-atomic access, but without the UB of mixing atomic and
+    /// non-atomic ops on the same `AtomicU8`.
     ///
     /// # Safety
-    /// Caller must guarantee no concurrent access to this slot's flags
+    /// Caller must guarantee no concurrent *write* to this slot's flags
     /// (e.g., TLS ownership or arena lock held).
     #[inline(always)]
     pub unsafe fn try_mark_freed_fast(&self) -> bool {
-        let ptr = &self.flags as *const core::sync::atomic::AtomicU8 as *const u8;
-        let old = ptr.read();
+        let old = self.flags.load(core::sync::atomic::Ordering::Relaxed);
         if old & SLOT_META_FLAG_FREED != 0 {
             return false;
         }
-        (ptr as *mut u8).write(old | SLOT_META_FLAG_FREED);
+        self.flags.store(old | SLOT_META_FLAG_FREED, core::sync::atomic::Ordering::Relaxed);
         true
     }
 
     #[inline(always)]
     pub fn clear(&self) {
-        self.checksum_store(0);
-        self.requested_size_store(0);
+        self.checksum.set(0);
+        self.requested_size.set(0);
         self.flags.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Non-atomic write helpers — safe because bitmap ownership prevents concurrent access
-    /// to the same slot's non-flag fields.
+    /// Write helpers using Cell — sound interior mutability without UnsafeCell
+    /// casts. Cell::set compiles to a plain store (zero overhead).
     #[inline(always)]
     pub fn checksum_store(&self, val: u64) {
-        unsafe { ((&self.checksum) as *const u64 as *mut u64).write(val) };
+        self.checksum.set(val);
     }
 
     #[inline(always)]
     pub fn requested_size_store(&self, val: u32) {
-        unsafe { ((&self.requested_size) as *const u32 as *mut u32).write(val) };
+        self.requested_size.set(val);
     }
 }
 
@@ -369,8 +372,8 @@ impl Arena {
                     if let Some(slot) = slab.slot_for_ptr(ptr) {
                         let slot_meta = slab.get_slot_meta(slot);
                         let mut alloc_meta = AllocationMeta::new(
-                            slot_meta.requested_size as usize,
-                            slot_meta.checksum,
+                            slot_meta.requested_size.get() as usize,
+                            slot_meta.checksum.get(),
                         );
                         if slot_meta.is_freed() {
                             alloc_meta.mark_freed();
@@ -396,7 +399,7 @@ impl Arena {
         let slab = &*(slab_raw as *mut Slab);
         if let Some(slot) = slab.slot_for_ptr(ptr) {
             let meta = slab.get_slot_meta(slot);
-            Some((meta.requested_size, slot))
+            Some((meta.requested_size.get(), slot))
         } else {
             None
         }
@@ -783,22 +786,22 @@ impl Arena {
         // Verify metadata integrity checksum (mask out freed bit we just set)
         if !crate::hardening::integrity::verify_checksum(
             slot_base as usize,
-            meta.requested_size,
+            meta.requested_size.get(),
             meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01,
-            meta.checksum,
+            meta.checksum.get(),
         ) {
             crate::hardening::abort_with_message("compatmalloc: metadata integrity check failed\n");
         }
 
         #[cfg(feature = "canaries")]
         {
-            let requested_size = meta.requested_size as usize;
+            let requested_size = meta.requested_size.get() as usize;
             let front_gap = ptr as usize - slot_base as usize;
             if front_gap > 0
                 && !crate::hardening::canary::check_canary_front(
                     slot_base,
                     front_gap,
-                    meta.checksum,
+                    meta.checksum.get(),
                 )
             {
                 crate::hardening::abort_with_message(
@@ -811,7 +814,7 @@ impl Arena {
                     ptr,
                     requested_size,
                     effective_slot_sz,
-                    meta.checksum,
+                    meta.checksum.get(),
                 )
             {
                 crate::hardening::abort_with_message(
@@ -983,7 +986,7 @@ impl Arena {
 
                     if !is_allocated {
                         // Free slot: metadata should be cleared
-                        if meta.requested_size != 0 && !meta.is_freed() {
+                        if meta.requested_size.get() != 0 && !meta.is_freed() {
                             result.bitmap_inconsistencies += 1;
                             result.errors_found += 1;
                         }
@@ -1008,9 +1011,9 @@ impl Arena {
                     let slot_base = slab.slot_base(slot);
                     if !crate::hardening::integrity::verify_checksum(
                         slot_base as usize,
-                        meta.requested_size,
+                        meta.requested_size.get(),
                         meta.flags.load(core::sync::atomic::Ordering::Relaxed),
-                        meta.checksum,
+                        meta.checksum.get(),
                     ) {
                         result.checksum_failures += 1;
                         result.errors_found += 1;
@@ -1020,7 +1023,7 @@ impl Arena {
                     // Verify canary bytes if enabled
                     #[cfg(feature = "canaries")]
                     {
-                        let requested_size = meta.requested_size as usize;
+                        let requested_size = meta.requested_size.get() as usize;
                         let aligned_size = align_up(requested_size, crate::util::MIN_ALIGN);
                         let gap = if aligned_size >= slot_sz {
                             0
@@ -1032,7 +1035,7 @@ impl Arena {
                             && !crate::hardening::canary::check_canary_front(
                                 slot_base,
                                 gap,
-                                meta.checksum,
+                                meta.checksum.get(),
                             )
                         {
                             result.canary_failures += 1;
@@ -1046,7 +1049,7 @@ impl Arena {
                                 user_ptr,
                                 requested_size,
                                 effective_slot_sz,
-                                meta.checksum,
+                                meta.checksum.get(),
                             )
                         {
                             result.canary_failures += 1;

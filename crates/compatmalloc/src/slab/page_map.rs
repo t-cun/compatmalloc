@@ -270,7 +270,7 @@ impl PageMap {
             return None;
         }
         let (l1_idx, l2_idx) = Self::indices(ptr);
-        let l2 = (*l1.add(l1_idx)).load(Ordering::Relaxed);
+        let l2 = (*l1.add(l1_idx)).load(Ordering::Acquire);
         if l2.is_null() {
             return None;
         }
