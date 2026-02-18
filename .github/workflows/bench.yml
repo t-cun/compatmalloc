@@ -16,8 +16,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # =========================================================================
+  # Job 1: x86_64 benchmarks (multi-allocator, best-of-3, app benchmarks)
+  # =========================================================================
   bench:
-    name: Run benchmarks
+    name: Benchmark (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +37,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-21 lld-21
 
+      - name: Install allocator libraries and benchmark deps
+        run: |
+          sudo apt-get install -y -qq \
+            libjemalloc2 libjemalloc-dev \
+            libmimalloc2.0 libmimalloc-dev \
+            bc \
+            redis-server redis-tools \
+            nginx-light wrk
+
       - name: Build release library
         run: cargo build --release
 
@@ -43,135 +55,555 @@ jobs:
       - name: Compile micro benchmark
         run: rustc -O benches/src/micro.rs -o target/release/micro
 
-      - name: Run glibc baseline
+      - name: Create best-of-3 helper script
         run: |
-          ALLOCATOR_NAME=glibc ./target/release/micro 2>&1 | tee bench-glibc.txt
+          cat > /tmp/run_best_of_3.sh <<'HELPER'
+          #!/bin/bash
+          # run_best_of_3.sh NAME [PRELOAD] [ENV_EXTRA]
+          #
+          # Runs ./target/release/micro 3 times with the given NAME, optional
+          # LD_PRELOAD, and optional extra environment variable.
+          # Keeps the run with the lowest latency_64 value.
+          # Writes:
+          #   bench-NAME-best.txt  - BEST|NAME|latency_64=X|throughput_1t=X|throughput_4t=X
+          #   bench-NAME.txt       - full output from the best run (for per-size data)
+          set -euo pipefail
 
-      - name: Run compatmalloc
+          NAME="$1"
+          PRELOAD="${2:-}"
+          ENV_EXTRA="${3:-}"
+
+          BINARY="./target/release/micro"
+          RUNS=3
+
+          best_latency=""
+          best_summary=""
+          best_output=""
+
+          echo "=== $NAME: running $RUNS iterations ==="
+
+          for ((i = 1; i <= RUNS; i++)); do
+              echo "  run $i/$RUNS ..."
+
+              # Build the command
+              cmd_prefix=()
+              if [ -n "$PRELOAD" ] || [ -n "$ENV_EXTRA" ]; then
+                  cmd_prefix=(env)
+                  [ -n "$PRELOAD" ] && cmd_prefix+=(LD_PRELOAD="$PRELOAD")
+                  [ -n "$ENV_EXTRA" ] && cmd_prefix+=("$ENV_EXTRA")
+              fi
+
+              output=$( ALLOCATOR_NAME="$NAME" "${cmd_prefix[@]}" "$BINARY" 2>&1 ) || true
+
+              summary=$(echo "$output" | grep '^SUMMARY|' || true)
+              if [ -z "$summary" ]; then
+                  echo "    WARNING: no SUMMARY line found"
+                  best_output="$output"
+                  continue
+              fi
+
+              latency=$(echo "$summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
+              echo "    latency_64=${latency}ns"
+
+              if [ -z "$best_latency" ] || \
+                 [ "$(echo "$latency < $best_latency" | bc 2>/dev/null)" = "1" ]; then
+                  best_latency="$latency"
+                  best_summary="$summary"
+                  best_output="$output"
+              fi
+          done
+
+          echo "  best latency_64=${best_latency}ns"
+          echo ""
+
+          # Save full output from the best run
+          echo "$best_output" > "bench-${NAME}.txt"
+
+          # Extract fields and write best-of-3 summary
+          if [ -n "$best_summary" ]; then
+              lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
+              t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
+              t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
+              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}" > "bench-${NAME}-best.txt"
+          else
+              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0" > "bench-${NAME}-best.txt"
+          fi
+          HELPER
+          chmod +x /tmp/run_best_of_3.sh
+
+      - name: Benchmark glibc (baseline)
+        run: /tmp/run_best_of_3.sh glibc
+
+      - name: Benchmark compatmalloc
+        run: /tmp/run_best_of_3.sh compatmalloc ./target/release/libcompatmalloc.so
+
+      - name: Benchmark passthrough
+        run: /tmp/run_best_of_3.sh passthrough ./target/release/libcompatmalloc.so COMPATMALLOC_DISABLE=1
+
+      - name: Benchmark jemalloc
         run: |
-          ALLOCATOR_NAME=compatmalloc \
-            LD_PRELOAD=./target/release/libcompatmalloc.so \
-            ./target/release/micro 2>&1 | tee bench-compatmalloc.txt
+          JEMALLOC_LIB=$(ldconfig -p 2>/dev/null | grep libjemalloc.so | head -1 | awk '{print $NF}' || true)
+          if [ -n "$JEMALLOC_LIB" ]; then
+            echo "Found jemalloc at: $JEMALLOC_LIB"
+            /tmp/run_best_of_3.sh jemalloc "$JEMALLOC_LIB"
+          else
+            echo "jemalloc not found, skipping"
+          fi
+
+      - name: Benchmark mimalloc
+        run: |
+          MIMALLOC_LIB=$(ldconfig -p 2>/dev/null | grep libmimalloc.so | head -1 | awk '{print $NF}' || true)
+          if [ -z "$MIMALLOC_LIB" ]; then
+            for p in /usr/lib/x86_64-linux-gnu/libmimalloc.so /usr/local/lib/libmimalloc.so; do
+              if [ -f "$p" ]; then
+                MIMALLOC_LIB="$p"
+                break
+              fi
+            done
+          fi
+          if [ -n "$MIMALLOC_LIB" ]; then
+            echo "Found mimalloc at: $MIMALLOC_LIB"
+            /tmp/run_best_of_3.sh mimalloc "$MIMALLOC_LIB"
+          else
+            echo "mimalloc not found, skipping"
+          fi
+
+      - name: Benchmark scudo
+        run: |
+          SCUDO_LIB=""
+          for p in /usr/lib/x86_64-linux-gnu/libscudo*.so \
+                   /usr/lib/llvm-*/lib/clang/*/lib/linux/libclang_rt.scudo*-x86_64.so; do
+            if [ -f "$p" ]; then
+              SCUDO_LIB="$p"
+              break
+            fi
+          done
+          if [ -n "$SCUDO_LIB" ]; then
+            echo "Found scudo at: $SCUDO_LIB"
+            /tmp/run_best_of_3.sh scudo "$SCUDO_LIB"
+          else
+            echo "scudo not found, skipping"
+          fi
+
+      - name: Run app benchmarks
+        run: |
+          chmod +x benches/scripts/run_app_benchmarks.sh
+          ./benches/scripts/run_app_benchmarks.sh ./target/release/libcompatmalloc.so
 
       - name: Generate results
         run: |
-          # Parse SUMMARY lines
-          glibc_summary=$(grep '^SUMMARY|' bench-glibc.txt || echo "")
-          compat_summary=$(grep '^SUMMARY|' bench-compatmalloc.txt || echo "")
-
-          # Extract metrics
-          parse_field() {
-            echo "$1" | sed "s/.*$2=\([0-9.]*\).*/\1/"
-          }
-
-          g_lat=$(parse_field "$glibc_summary" "latency_64")
-          g_t1=$(parse_field "$glibc_summary" "throughput_1t")
-          g_t4=$(parse_field "$glibc_summary" "throughput_4t")
-
-          c_lat=$(parse_field "$compat_summary" "latency_64")
-          c_t1=$(parse_field "$compat_summary" "throughput_1t")
-          c_t4=$(parse_field "$compat_summary" "throughput_4t")
-
-          # Compute ratios
-          if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
-            lat_ratio=$(echo "scale=2; $c_lat / $g_lat" | bc 2>/dev/null || echo "?")
-          else
-            lat_ratio="?"
-          fi
-          if [ -n "$g_t1" ] && [ "$g_t1" != "0" ] && [ "$g_t1" != "0.0" ]; then
-            t1_ratio=$(echo "scale=2; $c_t1 / $g_t1" | bc 2>/dev/null || echo "?")
-          else
-            t1_ratio="?"
-          fi
-          if [ -n "$g_t4" ] && [ "$g_t4" != "0" ] && [ "$g_t4" != "0.0" ]; then
-            t4_ratio=$(echo "scale=2; $c_t4 / $g_t4" | bc 2>/dev/null || echo "?")
-          else
-            t4_ratio="?"
-          fi
-
           timestamp=$(date -u '+%Y-%m-%d %H:%M UTC')
           commit_sha="${GITHUB_SHA:0:7}"
+          arch=$(uname -m)
 
-          # --- GitHub Step Summary ---
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Benchmark Results
+          # ---- Parse all best-of-3 result files ----
+          parse_best() {
+            local file="$1" field="$2"
+            if [ -f "$file" ]; then
+              sed "s/.*${field}=\([0-9.]*\).*/\1/" "$file"
+            else
+              echo "0"
+            fi
+          }
 
-          **Commit:** \`${commit_sha}\` | **Date:** ${timestamp} | **Runner:** \`$(uname -m)\`
+          # Collect all allocator names from bench-*-best.txt files
+          allocators=()
+          for f in bench-*-best.txt; do
+            [ -f "$f" ] || continue
+            name=$(sed 's/.*BEST|\([^|]*\)|.*/\1/' "$f")
+            allocators+=("$name")
+          done
 
-          ### Key Metrics
+          # Parse glibc baseline
+          g_lat=$(parse_best "bench-glibc-best.txt" "latency_64")
+          g_t1=$(parse_best "bench-glibc-best.txt" "throughput_1t")
+          g_t4=$(parse_best "bench-glibc-best.txt" "throughput_4t")
 
-          | Metric | glibc | compatmalloc | Ratio |
-          |--------|------:|-------------:|------:|
-          | **64B malloc+free latency** | ${g_lat} ns | ${c_lat} ns | ${lat_ratio}x |
-          | **Single-thread throughput** | ${g_t1} Mops/s | ${c_t1} Mops/s | ${t1_ratio}x |
-          | **4-thread throughput** | ${g_t4} Mops/s | ${c_t4} Mops/s | ${t4_ratio}x |
+          # ---- Build comparison table rows ----
+          table_rows=""
+          for name in "${allocators[@]}"; do
+            lat=$(parse_best "bench-${name}-best.txt" "latency_64")
+            t1=$(parse_best "bench-${name}-best.txt" "throughput_1t")
+            t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
 
-          <details>
-          <summary>Full glibc output</summary>
+            # Compute ratios vs glibc
+            if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
+              lat_ratio=$(echo "scale=2; $lat / $g_lat" | bc 2>/dev/null || echo "?")
+            else
+              lat_ratio="?"
+            fi
+            if [ -n "$g_t1" ] && [ "$g_t1" != "0" ] && [ "$g_t1" != "0.0" ]; then
+              t1_ratio=$(echo "scale=2; $t1 / $g_t1" | bc 2>/dev/null || echo "?")
+            else
+              t1_ratio="?"
+            fi
+            if [ -n "$g_t4" ] && [ "$g_t4" != "0" ] && [ "$g_t4" != "0.0" ]; then
+              t4_ratio=$(echo "scale=2; $t4 / $g_t4" | bc 2>/dev/null || echo "?")
+            else
+              t4_ratio="?"
+            fi
 
-          \`\`\`
-          $(cat bench-glibc.txt)
-          \`\`\`
-          </details>
+            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x |
+          "
+          done
 
-          <details>
-          <summary>Full compatmalloc output</summary>
+          # ---- Build app benchmark table ----
+          app_table=""
+          if [ -f bench-apps.txt ]; then
+            while IFS='|' read -r _ app_name glibc_val compat_val overhead_val; do
+              g_s="${glibc_val#glibc=}"
+              c_s="${compat_val#compat=}"
+              oh="${overhead_val#overhead=}"
+              app_table="${app_table}| ${app_name} | ${g_s} | ${c_s} | ${oh} |
+          "
+            done < bench-apps.txt
+          fi
 
-          \`\`\`
-          $(cat bench-compatmalloc.txt)
-          \`\`\`
-          </details>
-          EOF
-
-          # --- Generated docs page ---
+          # ---- Generated docs page ----
           mkdir -p docs/src/generated
           cat > docs/src/generated/benchmark-results.md <<EOF
-          ## Latest CI Results
+          ## Latest CI Results (x86_64)
 
           > Auto-generated by CI on ${timestamp} from commit [\`${commit_sha}\`](https://github.com/t-cun/compatmalloc/commit/${GITHUB_SHA}).
           > Results are from GitHub Actions runners (shared infrastructure) and may vary between runs.
+          > Each allocator is run 3 times; the **best (lowest latency)** result is kept.
 
-          ### Key Metrics
+          ### Multi-Allocator Comparison
 
-          | Metric | glibc | compatmalloc | Ratio |
-          |--------|------:|-------------:|------:|
-          | **64B malloc+free latency** | ${g_lat} ns | ${c_lat} ns | ${lat_ratio}x |
-          | **Single-thread throughput** | ${g_t1} Mops/s | ${c_t1} Mops/s | ${t1_ratio}x |
-          | **4-thread throughput** | ${g_t4} Mops/s | ${c_t4} Mops/s | ${t4_ratio}x |
+          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio |
+          |-----------|------------:|------:|--------------:|------:|--------------:|------:|
+          ${table_rows}
+
+          > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
+          >
+          > **Hardened allocators:** compatmalloc, scudo. These have security features (guard pages, quarantine, etc.) that add overhead vs. pure-performance allocators.
 
           ### malloc/free Latency by Size (glibc)
 
           \`\`\`
-          $(grep '  size=' bench-glibc.txt || echo "No data")
+          $(grep '  size=' bench-glibc.txt 2>/dev/null || echo "No data")
           \`\`\`
 
           ### malloc/free Latency by Size (compatmalloc)
 
           \`\`\`
-          $(grep '  size=' bench-compatmalloc.txt || echo "No data")
+          $(grep '  size=' bench-compatmalloc.txt 2>/dev/null || echo "No data")
           \`\`\`
 
           ### Multi-threaded Throughput (glibc)
 
           \`\`\`
-          $(grep '  threads=' bench-glibc.txt || echo "No data")
+          $(grep '  threads=' bench-glibc.txt 2>/dev/null || echo "No data")
           \`\`\`
 
           ### Multi-threaded Throughput (compatmalloc)
 
           \`\`\`
-          $(grep '  threads=' bench-compatmalloc.txt || echo "No data")
+          $(grep '  threads=' bench-compatmalloc.txt 2>/dev/null || echo "No data")
+          \`\`\`
+
+          ### Real-World Application Overhead
+
+          | Application | glibc | compatmalloc | Overhead |
+          |-------------|------:|-------------:|---------:|
+          ${app_table}
+
+          > Application benchmarks measure wall-clock time for real programs (Python, Redis, nginx, SQLite, Git).
+          > Overhead = (compatmalloc_time / glibc_time - 1) * 100%.
+          EOF
+
+          # ---- GitHub Step Summary (same content) ----
+          cp docs/src/generated/benchmark-results.md "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-x86-results
+          path: |
+            bench-*.txt
+            docs/src/generated/benchmark-results.md
+          retention-days: 90
+
+  # =========================================================================
+  # Job 2: ARM64 benchmarks
+  # =========================================================================
+  bench-arm64:
+    name: Benchmark (ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system clang, lld, and allocator libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang lld \
+            libjemalloc2 libjemalloc-dev \
+            libmimalloc2.0 libmimalloc-dev \
+            bc
+
+      - name: Build release library
+        run: cargo build --release
+        env:
+          CC: clang
+          RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=lld"
+
+      - name: Verify library exists
+        run: test -f target/release/libcompatmalloc.so
+
+      - name: Compile micro benchmark
+        run: rustc -O benches/src/micro.rs -o target/release/micro
+
+      - name: Create best-of-3 helper script
+        run: |
+          cat > /tmp/run_best_of_3.sh <<'HELPER'
+          #!/bin/bash
+          set -euo pipefail
+
+          NAME="$1"
+          PRELOAD="${2:-}"
+          ENV_EXTRA="${3:-}"
+
+          BINARY="./target/release/micro"
+          RUNS=3
+
+          best_latency=""
+          best_summary=""
+          best_output=""
+
+          echo "=== $NAME: running $RUNS iterations ==="
+
+          for ((i = 1; i <= RUNS; i++)); do
+              echo "  run $i/$RUNS ..."
+
+              cmd_prefix=()
+              if [ -n "$PRELOAD" ] || [ -n "$ENV_EXTRA" ]; then
+                  cmd_prefix=(env)
+                  [ -n "$PRELOAD" ] && cmd_prefix+=(LD_PRELOAD="$PRELOAD")
+                  [ -n "$ENV_EXTRA" ] && cmd_prefix+=("$ENV_EXTRA")
+              fi
+
+              output=$( ALLOCATOR_NAME="$NAME" "${cmd_prefix[@]}" "$BINARY" 2>&1 ) || true
+
+              summary=$(echo "$output" | grep '^SUMMARY|' || true)
+              if [ -z "$summary" ]; then
+                  echo "    WARNING: no SUMMARY line found"
+                  best_output="$output"
+                  continue
+              fi
+
+              latency=$(echo "$summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
+              echo "    latency_64=${latency}ns"
+
+              if [ -z "$best_latency" ] || \
+                 [ "$(echo "$latency < $best_latency" | bc 2>/dev/null)" = "1" ]; then
+                  best_latency="$latency"
+                  best_summary="$summary"
+                  best_output="$output"
+              fi
+          done
+
+          echo "  best latency_64=${best_latency}ns"
+          echo ""
+
+          echo "$best_output" > "bench-${NAME}.txt"
+
+          if [ -n "$best_summary" ]; then
+              lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
+              t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
+              t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
+              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}" > "bench-${NAME}-best.txt"
+          else
+              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0" > "bench-${NAME}-best.txt"
+          fi
+          HELPER
+          chmod +x /tmp/run_best_of_3.sh
+
+      - name: Benchmark glibc (baseline)
+        run: /tmp/run_best_of_3.sh glibc
+
+      - name: Benchmark compatmalloc
+        run: /tmp/run_best_of_3.sh compatmalloc ./target/release/libcompatmalloc.so
+
+      - name: Benchmark jemalloc
+        run: |
+          JEMALLOC_LIB=$(ldconfig -p 2>/dev/null | grep libjemalloc.so | head -1 | awk '{print $NF}' || true)
+          if [ -n "$JEMALLOC_LIB" ]; then
+            echo "Found jemalloc at: $JEMALLOC_LIB"
+            /tmp/run_best_of_3.sh jemalloc "$JEMALLOC_LIB"
+          else
+            echo "jemalloc not found, skipping"
+          fi
+
+      - name: Benchmark mimalloc
+        run: |
+          MIMALLOC_LIB=$(ldconfig -p 2>/dev/null | grep libmimalloc.so | head -1 | awk '{print $NF}' || true)
+          if [ -z "$MIMALLOC_LIB" ]; then
+            for p in /usr/lib/aarch64-linux-gnu/libmimalloc.so /usr/local/lib/libmimalloc.so; do
+              if [ -f "$p" ]; then
+                MIMALLOC_LIB="$p"
+                break
+              fi
+            done
+          fi
+          if [ -n "$MIMALLOC_LIB" ]; then
+            echo "Found mimalloc at: $MIMALLOC_LIB"
+            /tmp/run_best_of_3.sh mimalloc "$MIMALLOC_LIB"
+          else
+            echo "mimalloc not found, skipping"
+          fi
+
+      - name: Generate ARM64 results
+        run: |
+          timestamp=$(date -u '+%Y-%m-%d %H:%M UTC')
+          commit_sha="${GITHUB_SHA:0:7}"
+          arch=$(uname -m)
+
+          parse_best() {
+            local file="$1" field="$2"
+            if [ -f "$file" ]; then
+              sed "s/.*${field}=\([0-9.]*\).*/\1/" "$file"
+            else
+              echo "0"
+            fi
+          }
+
+          allocators=()
+          for f in bench-*-best.txt; do
+            [ -f "$f" ] || continue
+            name=$(sed 's/.*BEST|\([^|]*\)|.*/\1/' "$f")
+            allocators+=("$name")
+          done
+
+          g_lat=$(parse_best "bench-glibc-best.txt" "latency_64")
+          g_t1=$(parse_best "bench-glibc-best.txt" "throughput_1t")
+          g_t4=$(parse_best "bench-glibc-best.txt" "throughput_4t")
+
+          table_rows=""
+          for name in "${allocators[@]}"; do
+            lat=$(parse_best "bench-${name}-best.txt" "latency_64")
+            t1=$(parse_best "bench-${name}-best.txt" "throughput_1t")
+            t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
+
+            if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
+              lat_ratio=$(echo "scale=2; $lat / $g_lat" | bc 2>/dev/null || echo "?")
+            else
+              lat_ratio="?"
+            fi
+            if [ -n "$g_t1" ] && [ "$g_t1" != "0" ] && [ "$g_t1" != "0.0" ]; then
+              t1_ratio=$(echo "scale=2; $t1 / $g_t1" | bc 2>/dev/null || echo "?")
+            else
+              t1_ratio="?"
+            fi
+            if [ -n "$g_t4" ] && [ "$g_t4" != "0" ] && [ "$g_t4" != "0.0" ]; then
+              t4_ratio=$(echo "scale=2; $t4 / $g_t4" | bc 2>/dev/null || echo "?")
+            else
+              t4_ratio="?"
+            fi
+
+            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x |
+          "
+          done
+
+          cat > bench-arm64-results.md <<EOF
+          ## ARM64 CI Results
+
+          > Auto-generated by CI on ${timestamp} from commit [\`${commit_sha}\`](https://github.com/t-cun/compatmalloc/commit/${GITHUB_SHA}).
+          > Runner architecture: \`${arch}\` | Best-of-3 runs.
+
+          ### Multi-Allocator Comparison (ARM64)
+
+          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio |
+          |-----------|------------:|------:|--------------:|------:|--------------:|------:|
+          ${table_rows}
+
+          > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
+
+          ### malloc/free Latency by Size - ARM64 (glibc)
+
+          \`\`\`
+          $(grep '  size=' bench-glibc.txt 2>/dev/null || echo "No data")
+          \`\`\`
+
+          ### malloc/free Latency by Size - ARM64 (compatmalloc)
+
+          \`\`\`
+          $(grep '  size=' bench-compatmalloc.txt 2>/dev/null || echo "No data")
+          \`\`\`
+
+          ### Multi-threaded Throughput - ARM64 (glibc)
+
+          \`\`\`
+          $(grep '  threads=' bench-glibc.txt 2>/dev/null || echo "No data")
+          \`\`\`
+
+          ### Multi-threaded Throughput - ARM64 (compatmalloc)
+
+          \`\`\`
+          $(grep '  threads=' bench-compatmalloc.txt 2>/dev/null || echo "No data")
           \`\`\`
           EOF
 
-      - name: Upload benchmark output
+          # Step summary
+          cat bench-arm64-results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ARM64 benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-${{ github.sha }}
+          name: bench-arm64-results
           path: |
-            bench-glibc.txt
-            bench-compatmalloc.txt
+            bench-*.txt
+            bench-arm64-results.md
           retention-days: 90
+
+  # =========================================================================
+  # Job 3: Merge results and update docs
+  # =========================================================================
+  update-docs:
+    name: Update docs with benchmark results
+    needs: [bench, bench-arm64]
+    if: always() && needs.bench.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download x86_64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-x86-results
+          path: bench-x86
+
+      - name: Download ARM64 artifacts
+        uses: actions/download-artifact@v4
+        if: needs.bench-arm64.result == 'success'
+        with:
+          name: bench-arm64-results
+          path: bench-arm64
+        continue-on-error: true
+
+      - name: Assemble final benchmark docs
+        run: |
+          mkdir -p docs/src/generated
+
+          # Place x86_64 results
+          if [ -f bench-x86/docs/src/generated/benchmark-results.md ]; then
+            cp bench-x86/docs/src/generated/benchmark-results.md docs/src/generated/benchmark-results.md
+          fi
+
+          # Append ARM64 results if available
+          if [ -f bench-arm64/bench-arm64-results.md ]; then
+            echo "" >> docs/src/generated/benchmark-results.md
+            echo "---" >> docs/src/generated/benchmark-results.md
+            echo "" >> docs/src/generated/benchmark-results.md
+            cat bench-arm64/bench-arm64-results.md >> docs/src/generated/benchmark-results.md
+          fi
 
       - name: Commit benchmark results to docs
         if: github.ref == 'refs/heads/main'
