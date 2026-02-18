@@ -2,11 +2,16 @@
 # Run benchmarks comparing compatmalloc against system allocator, jemalloc,
 # mimalloc, and scudo (when available).
 #
-# Usage: ./run_comparison.sh [bench_binary] [args...]
+# Usage: ./run_comparison.sh [--runs=N] [bench_binary] [args...]
+#
+# Options:
+#   --runs=N   Run each allocator N times, keep the best (lowest latency) result.
+#              Default: 1 (single run, current behavior).
 #
 # Example:
 #   ./run_comparison.sh target/release/larson 4 5
 #   ./run_comparison.sh target/release/micro
+#   ./run_comparison.sh --runs=3 target/release/micro
 #   ./run_comparison.sh target/release/cfrac 1000000
 
 set -euo pipefail
@@ -14,6 +19,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/../.."
 LIB="$PROJECT_ROOT/target/release/libcompatmalloc.so"
+
+# Parse --runs=N before positional arguments
+RUNS=1
+remaining_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --runs=*) RUNS="${arg#--runs=}" ;;
+        *) remaining_args+=("$arg") ;;
+    esac
+done
+set -- "${remaining_args[@]+"${remaining_args[@]}"}"
 
 BENCH_BINARY="${1:-$PROJECT_ROOT/target/release/micro}"
 shift || true
@@ -42,20 +58,58 @@ run_bench() {
     local env_extra="${3:-}"
 
     echo "--- $name ---"
-    local output
-    if [ -n "$preload" ]; then
-        output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; LD_PRELOAD="$preload" "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+
+    local best_summary=""
+    local best_latency=""
+    local best_output=""
+
+    for ((run=1; run<=RUNS; run++)); do
+        if [ "$RUNS" -gt 1 ]; then
+            echo "  run $run/$RUNS"
+        fi
+
+        local output
+        if [ -n "$preload" ]; then
+            output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; LD_PRELOAD="$preload" "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+        else
+            output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+        fi
+
+        # Extract SUMMARY line if present
+        local summary_line
+        summary_line=$(echo "$output" | grep "^SUMMARY|" || true)
+
+        if [ -n "$summary_line" ]; then
+            local latency
+            latency=$(echo "$summary_line" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
+
+            # Keep the run with the lowest latency_64
+            if [ -z "$best_latency" ] || \
+               [ "$(echo "$latency < $best_latency" | bc 2>/dev/null)" = "1" ]; then
+                best_latency="$latency"
+                best_summary="$summary_line"
+                best_output="$output"
+            fi
+        else
+            # No SUMMARY line; keep last output
+            best_output="$output"
+        fi
+    done
+
+    # Print output: full output for single run, abbreviated for multi-run
+    if [ "$RUNS" -eq 1 ]; then
+        echo "$best_output"
     else
-        output=$(export ALLOCATOR_NAME="$name"; [ -n "$env_extra" ] && export $env_extra; "$BENCH_BINARY" $BENCH_ARGS 2>&1) || true
+        if [ -n "$best_summary" ]; then
+            echo "  best latency_64=${best_latency}ns"
+        else
+            echo "$best_output"
+        fi
     fi
-    echo "$output"
     echo ""
 
-    # Extract SUMMARY line if present
-    local summary_line
-    summary_line=$(echo "$output" | grep "^SUMMARY|" || true)
-    if [ -n "$summary_line" ]; then
-        SUMMARY_LINES+=("$summary_line")
+    if [ -n "$best_summary" ]; then
+        SUMMARY_LINES+=("$best_summary")
     fi
 }
 
