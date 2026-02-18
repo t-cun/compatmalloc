@@ -38,9 +38,11 @@ int main(void) {
     printf("[3] free(%p)    => double free! (should be caught)\n", (void *)ptr);
     free(ptr);
 
-    /* If we reach here, the double-free was NOT detected */
+    /* If we reach here, the double-free was NOT detected.
+     * On glibc >= 2.29 this is unlikely (tcache key catches it),
+     * but on older glibc or if the tcache key is bypassed, we get here. */
     printf("\n[!] Double-free was NOT detected.\n");
-    printf("    Under glibc, the tcache freelist is now corrupted.\n");
+    printf("    On glibc < 2.29 (no tcache key): the freelist is corrupted.\n");
     printf("    Subsequent malloc() calls may return the same pointer,\n");
     printf("    enabling use-after-free exploitation.\n\n");
 

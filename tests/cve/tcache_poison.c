@@ -2,8 +2,11 @@
  * Tcache Poisoning via 1-Byte Overflow Proof of Concept
  * Demonstrates the CVE-2024-2961 exploitation technique.
  *
- * glibc behavior: 1-byte overflow modifies tcache fd pointer.
- * compatmalloc behavior: Canary bytes detect overflow + out-of-band metadata.
+ * glibc behavior: A write past the requested size but within glibc's
+ * usable chunk region is silently accepted -- no detection at all.
+ * In the real CVE, larger overflows corrupt adjacent tcache fd pointers.
+ * compatmalloc behavior: Canary bytes in the padding [requested..slot_size)
+ * detect the write on free. Out-of-band metadata prevents fd corruption.
  *
  * Note: compatmalloc uses deferred batch verification (~every 64 frees).
  * We pre-allocate many same-class blocks, then free them after the
@@ -53,8 +56,11 @@ int main(void) {
     memcpy(&original_fd, chunk_b, sizeof(original_fd));
     printf("[4] chunk_b tcache fd = 0x%016lx\n\n", (unsigned long)original_fd);
 
-    /* 1-byte overflow from chunk_a into chunk_b (CVE-2024-2961 pattern).
-     * Under glibc, this overwrites the inline tcache next pointer.
+    /* 1-byte write past requested size (CVE-2024-2961 pattern).
+     * Under glibc, offset 50 is still within the usable 56-byte region
+     * of a 64-byte chunk, so the write is silently accepted -- no detection.
+     * In the real CVE, larger overflows (1-3 bytes into adjacent chunks)
+     * corrupt tcache fd pointers, enabling arbitrary write.
      * Under compatmalloc, this lands in canary bytes [50..64). */
     printf("[5] Simulating 1-byte overflow from chunk_a into chunk_b...\n");
     chunk_a[chunk_size] = 0x42;
