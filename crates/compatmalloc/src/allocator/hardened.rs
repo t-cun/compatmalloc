@@ -1,10 +1,10 @@
+use crate::allocator::thread_cache;
 use crate::hardening::metadata::MetadataTable;
 use crate::large::LargeAllocator;
 use crate::slab::page_map;
 use crate::slab::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES};
 use crate::slab::{size_class_index, Arena};
 use crate::util::{MAX_ARENAS, MIN_ALIGN};
-use crate::allocator::thread_cache;
 use crate::{config, platform};
 use core::ptr;
 
@@ -113,12 +113,9 @@ impl HardenedAllocator {
                         let ca = cached.arena_index as usize;
                         if ca < self.num_arenas {
                             if cached.cached_size == alloc_size as u32 {
-                                let slab =
-                                    &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
-                                let meta =
-                                    slab.get_slot_meta_ref(cached.slot_index as usize);
-                                meta.flags
-                                    .store(0, core::sync::atomic::Ordering::Relaxed);
+                                let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
+                                let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
+                                meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
                                 return cached.ptr;
                             }
                             return self.arenas[ca].setup_cached_alloc_metadata(
@@ -164,8 +161,7 @@ impl HardenedAllocator {
                 if cached.cached_size == size as u32 {
                     let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
                     let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
-                    meta.flags
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
+                    meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
                     return Some(cached.ptr);
                 }
                 return Some(self.arenas[ca].setup_cached_alloc_metadata(
@@ -185,8 +181,7 @@ impl HardenedAllocator {
                 if cached.cached_size == size as u32 {
                     let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
                     let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
-                    meta.flags
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
+                    meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
                     return Some(cached.ptr);
                 }
                 return Some(self.arenas[ca].setup_cached_alloc_metadata(
@@ -412,11 +407,7 @@ impl HardenedAllocator {
     /// Inline free fast path: MRU page lookup → CAS double-free → fast register.
     /// Shares cycles with malloc: stores freed slot in fast register for O(1) reuse.
     #[inline(always)]
-    unsafe fn free_to_cache(
-        &self,
-        s: &mut thread_cache::ThreadState,
-        ptr: *mut u8,
-    ) -> bool {
+    unsafe fn free_to_cache(&self, s: &mut thread_cache::ThreadState, ptr: *mut u8) -> bool {
         use crate::allocator::thread_cache::CachedSlot;
 
         // Page map MRU lookup
@@ -596,8 +587,7 @@ impl HardenedAllocator {
             let user_ptr = cached.ptr;
 
             // Verify integrity checksum (mask out freed bit)
-            let flags_masked =
-                meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
+            let flags_masked = meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
             if !crate::hardening::integrity::verify_checksum(
                 slot_base as usize,
                 meta.requested_size.get(),
@@ -674,17 +664,14 @@ impl HardenedAllocator {
         let slot_base = slab.data.add(slot_index * slot_sz);
 
         // Verify integrity checksum
-        let flags_masked =
-            meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
+        let flags_masked = meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
         if !crate::hardening::integrity::verify_checksum(
             slot_base as usize,
             meta.requested_size.get(),
             flags_masked,
             meta.checksum.get(),
         ) {
-            crate::hardening::abort_with_message(
-                "compatmalloc: metadata integrity check failed\n",
-            );
+            crate::hardening::abort_with_message("compatmalloc: metadata integrity check failed\n");
         }
 
         // Verify canary bytes

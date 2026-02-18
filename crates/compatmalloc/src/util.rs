@@ -27,7 +27,8 @@ pub const MIN_ALIGN: usize = 16;
 /// Falls back to 4096 if not yet initialized.
 /// Initialize to 4096 (the universal default) to eliminate the branch in page_size().
 /// After init_page_size() runs, this holds the real value from sysconf.
-static PAGE_SIZE_CACHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(4096);
+static PAGE_SIZE_CACHED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(4096);
 
 /// Cached log2(page_size) for fast division-free page number computation.
 /// Avoids ~35-cycle hardware `div` on every page_map lookup.

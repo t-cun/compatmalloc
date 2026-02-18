@@ -237,7 +237,14 @@ impl LargeAllocator {
                 // keeps its physical pages for fast reuse (matching glibc behavior).
                 // Physical pages are only released on eviction or when the cache
                 // is cleaned up. Guard pages remain PROT_NONE throughout.
-                Self::push_cached(inner, CachedMapping { base, total_size, data_size });
+                Self::push_cached(
+                    inner,
+                    CachedMapping {
+                        base,
+                        total_size,
+                        data_size,
+                    },
+                );
                 self.lock.unlock();
 
                 // Unregister from page map (lock-free atomic stores)

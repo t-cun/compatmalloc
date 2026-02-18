@@ -138,7 +138,6 @@ impl ClassCache {
         self.free_count = start;
         start // remaining in free buffer
     }
-
 }
 
 /// Thread-local cache for all size classes.
@@ -202,7 +201,6 @@ impl ThreadCache {
         cache.free_count = 0;
         (&cache.free_slots[..count], count)
     }
-
 }
 
 /// Consolidated thread-local state: cache + thread ID + RNG + page map MRU.
