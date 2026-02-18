@@ -157,10 +157,17 @@ impl HardenedAllocator {
         size: usize,
         class_idx: usize,
     ) -> Option<*mut u8> {
-        // Alloc cache pop
+        // Alloc cache pop with same-size fast path
         if let Some(cached) = s.cache.pop(class_idx) {
             let ca = cached.arena_index as usize;
             if ca < self.num_arenas {
+                if cached.cached_size == size as u32 {
+                    let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
+                    let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
+                    meta.flags
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
+                    return Some(cached.ptr);
+                }
                 return Some(self.arenas[ca].setup_cached_alloc_metadata(
                     cached.slab_ptr,
                     cached.slot_index,
@@ -175,9 +182,9 @@ impl HardenedAllocator {
         if let Some(cached) = s.cache.pop_free(class_idx) {
             let ca = cached.arena_index as usize;
             if ca < self.num_arenas {
-                let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
-                let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
-                if meta.requested_size == size as u32 {
+                if cached.cached_size == size as u32 {
+                    let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
+                    let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
                     meta.flags
                         .store(0, core::sync::atomic::Ordering::Relaxed);
                     return Some(cached.ptr);
@@ -209,11 +216,8 @@ impl HardenedAllocator {
 
         let remaining = s.cache.recycle_frees(class_idx, 32);
         if remaining > 0 {
-            let (buf, count) = s.cache.drain_frees(class_idx);
-            if count > 0 {
-                let arena_idx = s.arena_index(self.num_arenas);
-                self.flush_free_buffer_verified(&buf, count, arena_idx);
-            }
+            let arena_idx = s.arena_index(self.num_arenas);
+            self.drain_and_flush(&mut s.cache, class_idx, arena_idx);
         }
 
         if let Some(cached) = s.cache.pop(class_idx) {
@@ -326,10 +330,7 @@ impl HardenedAllocator {
 
                 // Verified flush: do deferred security checks then arena processing
                 if remaining > 0 {
-                    let (buf, count) = cache.drain_frees(class_idx);
-                    if count > 0 {
-                        self.flush_free_buffer_verified(&buf, count, arena_idx);
-                    }
+                    self.drain_and_flush(cache, class_idx, arena_idx);
                 }
 
                 // Try again after recycle
@@ -395,10 +396,11 @@ impl HardenedAllocator {
         }
 
         // Direct TLS access — no closure overhead, no reentrancy guard on free.
+        // Fork check omitted here: malloc's fork check handles cache invalidation,
+        // and parent's addresses are valid in the child (inherited memory).
         let state = thread_cache::get_thread_state_raw();
         if !state.is_null() {
             let s = &mut *state;
-            s.amortized_fork_check();
             if self.free_to_cache(s, ptr) {
                 return;
             }
@@ -447,40 +449,42 @@ impl HardenedAllocator {
         };
         let meta = slab.get_slot_meta_ref(slot_index);
 
-        // CAS double-free detection
-        if !meta.try_mark_freed() {
+        // Non-atomic double-free detection: single-writer guaranteed by TLS ownership.
+        // Replaces `lock cmpxchg` (~10-15 cycles) with plain load+store (~3 cycles).
+        if !meta.try_mark_freed_fast() {
             crate::hardening::abort_with_message("compatmalloc: double free detected\n");
         }
 
-        // Mark ever_freed for calloc optimization
+        // Mark ever_freed for calloc optimization (Relaxed load = 1 cycle on x86)
         if !slab.ever_freed.load(core::sync::atomic::Ordering::Relaxed) {
             slab.ever_freed
                 .store(true, core::sync::atomic::Ordering::Release);
         }
 
         // Store in fast register; evict old to free buffer.
-        // Shares work with malloc — malloc reads fast register for O(1) reuse.
-        // Cache requested_size so malloc can detect same-size reuse without
-        // touching slab metadata (avoids a pointer chase on the hot path).
-        let cached = CachedSlot {
-            ptr,
-            slab_ptr,
-            slot_index: slot_index as u16,
-            arena_index: arena_idx_u8,
-            _pad: 0,
-            cached_size: meta.requested_size,
-        };
-
-        if !s.fast_reg.ptr.is_null() {
-            let old_class = s.fast_reg_class as usize;
-            s.cache.push_free(old_class, s.fast_reg);
-            if s.cache.free_is_full(old_class) {
-                let (buf, count) = s.cache.drain_frees(old_class);
-                self.flush_free_buffer_verified(&buf, count, arena_idx);
-            }
+        // Hot path (fast_reg empty after malloc pop): write fields directly
+        // to fast_reg without intermediate stack copy. Cold path (eviction
+        // needed): build CachedSlot and call cold function.
+        let cached_size = meta.requested_size;
+        if s.fast_reg.ptr.is_null() {
+            s.fast_reg.ptr = ptr;
+            s.fast_reg.slab_ptr = slab_ptr;
+            s.fast_reg.slot_index = slot_index as u16;
+            s.fast_reg.arena_index = arena_idx_u8;
+            s.fast_reg._pad = 0;
+            s.fast_reg.cached_size = cached_size;
+            s.fast_reg_class = class_idx_u8;
+        } else {
+            let cached = CachedSlot {
+                ptr,
+                slab_ptr,
+                slot_index: slot_index as u16,
+                arena_index: arena_idx_u8,
+                _pad: 0,
+                cached_size,
+            };
+            self.free_evict_fast_reg(s, cached, class_idx_u8, arena_idx);
         }
-        s.fast_reg = cached;
-        s.fast_reg_class = class_idx_u8;
 
         true
     }
@@ -527,6 +531,45 @@ impl HardenedAllocator {
             if self.arenas[i].free(ptr) {
                 return;
             }
+        }
+    }
+
+    /// Cold path: evict the old fast register to the free buffer, storing the
+    /// new cached slot in its place. Separated from the hot path so the compiler
+    /// doesn't need to save registers for the drain call across the store.
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_evict_fast_reg(
+        &self,
+        s: &mut thread_cache::ThreadState,
+        new_cached: thread_cache::CachedSlot,
+        new_class: u8,
+        arena_idx: usize,
+    ) {
+        let old_class = s.fast_reg_class as usize;
+        s.cache.push_free(old_class, s.fast_reg);
+        if s.cache.free_is_full(old_class) {
+            self.drain_and_flush(&mut s.cache, old_class, arena_idx);
+        }
+        s.fast_reg = new_cached;
+        s.fast_reg_class = new_class;
+    }
+
+    /// Cold path: drain the per-class free buffer and flush it with security
+    /// verification. Separated from the hot free path so the 1536-byte drain
+    /// buffer is only stack-allocated when actually needed (avoids inflating
+    /// the hot path's stack frame from ~64 bytes to ~1560 bytes).
+    #[cold]
+    #[inline(never)]
+    unsafe fn drain_and_flush(
+        &self,
+        cache: &mut thread_cache::ThreadCache,
+        class_index: usize,
+        arena_idx: usize,
+    ) {
+        let (buf, count) = cache.drain_frees_ref(class_index);
+        if count > 0 {
+            self.flush_free_buffer_verified(buf, count, arena_idx);
         }
     }
 

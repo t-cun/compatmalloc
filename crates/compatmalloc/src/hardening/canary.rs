@@ -78,12 +78,16 @@ pub unsafe fn write_canary(ptr: *mut u8, requested_size: usize, slot_size: usize
     }
 
     let canary_start = ptr.add(requested_size);
-    let canary_bytes = canary.to_le_bytes();
 
-    // Fill the gap with repeating canary bytes
+    // Write u64 chunks for bulk fill, then tail bytes
     let mut i = 0;
+    while i + 8 <= gap {
+        (canary_start.add(i) as *mut u64).write_unaligned(canary);
+        i += 8;
+    }
+    let canary_bytes = canary.to_le_bytes();
     while i < gap {
-        canary_start.add(i).write(canary_bytes[i % 8]);
+        canary_start.add(i).write(canary_bytes[i & 7]);
         i += 1;
     }
 }
@@ -105,16 +109,21 @@ pub unsafe fn check_canary(
     }
 
     let canary_start = ptr.add(requested_size);
-    let canary_bytes = canary.to_le_bytes();
 
-    // Constant-time comparison: accumulate differences to prevent timing side-channel.
-    let mut diff: u8 = 0;
+    // Constant-time comparison using u64 chunks then tail bytes.
+    let mut diff: u64 = 0;
     let mut i = 0;
+    while i + 8 <= gap {
+        diff |= (canary_start.add(i) as *const u64).read_unaligned() ^ canary;
+        i += 8;
+    }
+    let canary_bytes = canary.to_le_bytes();
+    let mut byte_diff: u8 = 0;
     while i < gap {
-        diff |= canary_start.add(i).read() ^ canary_bytes[i % 8];
+        byte_diff |= canary_start.add(i).read() ^ canary_bytes[i & 7];
         i += 1;
     }
-    diff == 0
+    diff == 0 && byte_diff == 0
 }
 
 /// Write canary bytes to the front gap (before user data in right-aligned layout).
@@ -127,10 +136,14 @@ pub unsafe fn write_canary_front(slot_base: *mut u8, gap: usize, canary: u64) {
     if gap == 0 {
         return;
     }
-    let canary_bytes = canary.to_le_bytes();
     let mut i = 0;
+    while i + 8 <= gap {
+        (slot_base.add(i) as *mut u64).write_unaligned(canary);
+        i += 8;
+    }
+    let canary_bytes = canary.to_le_bytes();
     while i < gap {
-        slot_base.add(i).write(canary_bytes[i % 8]);
+        slot_base.add(i).write(canary_bytes[i & 7]);
         i += 1;
     }
 }
@@ -144,14 +157,19 @@ pub unsafe fn check_canary_front(slot_base: *mut u8, gap: usize, canary: u64) ->
     if gap == 0 {
         return true;
     }
-    let canary_bytes = canary.to_le_bytes();
-    let mut diff: u8 = 0;
+    let mut diff: u64 = 0;
     let mut i = 0;
+    while i + 8 <= gap {
+        diff |= (slot_base.add(i) as *const u64).read_unaligned() ^ canary;
+        i += 8;
+    }
+    let canary_bytes = canary.to_le_bytes();
+    let mut byte_diff: u8 = 0;
     while i < gap {
-        diff |= slot_base.add(i).read() ^ canary_bytes[i % 8];
+        byte_diff |= slot_base.add(i).read() ^ canary_bytes[i & 7];
         i += 1;
     }
-    diff == 0
+    diff == 0 && byte_diff == 0
 }
 
 /// Get the canary secret for use by integrity checksums.

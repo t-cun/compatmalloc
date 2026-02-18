@@ -50,6 +50,24 @@ impl SlotMeta {
         old & SLOT_META_FLAG_FREED == 0
     }
 
+    /// Non-atomic mark-freed for the TLS hot path where single-writer is
+    /// guaranteed by thread-cache ownership. Avoids `lock cmpxchg` (~10-15
+    /// cycles) in favor of plain `mov` + `test` + `mov` (~3 cycles).
+    ///
+    /// # Safety
+    /// Caller must guarantee no concurrent access to this slot's flags
+    /// (e.g., TLS ownership or arena lock held).
+    #[inline(always)]
+    pub unsafe fn try_mark_freed_fast(&self) -> bool {
+        let ptr = &self.flags as *const core::sync::atomic::AtomicU8 as *const u8;
+        let old = ptr.read();
+        if old & SLOT_META_FLAG_FREED != 0 {
+            return false;
+        }
+        (ptr as *mut u8).write(old | SLOT_META_FLAG_FREED);
+        true
+    }
+
     #[inline(always)]
     pub fn clear(&self) {
         self.checksum_store(0);

@@ -226,6 +226,16 @@ impl ThreadCache {
         (buf, count)
     }
 
+    /// Get a reference to the free buffer and its count, then reset the count.
+    /// Avoids copying the 1536-byte buffer to the caller's stack frame.
+    #[inline(always)]
+    pub fn drain_frees_ref(&mut self, class_index: usize) -> (&[CachedSlot], usize) {
+        let cache = &mut self.caches[class_index];
+        let count = cache.free_count;
+        cache.free_count = 0;
+        (&cache.free_slots[..count], count)
+    }
+
     /// Drain half the alloc entries for a size class. Returns (buffer, count).
     pub fn drain_half(&mut self, class_index: usize) -> ([CachedSlot; CACHE_SIZE], usize) {
         let mut buf = [CachedSlot {

@@ -73,17 +73,18 @@ static LOOKUP_TABLE: [u8; LOOKUP_TABLE_SIZE] = {
 /// Look up the size class index for a given allocation size.
 /// Returns `None` if the size exceeds the largest size class.
 /// Uses O(1) table lookup instead of binary search.
-#[inline]
+/// Hot path compiles to: cmp + lea + shr + movzbl = 4 instructions.
+#[inline(always)]
 pub fn size_class_index(size: usize) -> Option<usize> {
-    // Minimum allocation is MIN_ALIGN bytes
-    let size = if size < MIN_ALIGN { MIN_ALIGN } else { size };
-
     if size > LARGE_THRESHOLD {
         return None;
     }
 
-    // O(1) lookup: (size + 15) / 16 - 1 maps to the correct bucket
-    let bucket = size.div_ceil(MIN_ALIGN) - 1;
+    // For size >= 1: div_ceil(max(size, 16), 16) - 1 == (max(size, 16) - 1) >> 4
+    // Since min allocation is MIN_ALIGN (16), clamp small sizes.
+    // Most callers pass size >= 1, so max(size, 16) compiles to cmov.
+    let clamped = if size >= MIN_ALIGN { size } else { MIN_ALIGN };
+    let bucket = (clamped - 1) >> 4; // (size-1)/16, single sub+shift
     Some(LOOKUP_TABLE[bucket] as usize)
 }
 
@@ -108,11 +109,33 @@ pub static SLOT_MAGIC: [u64; NUM_SIZE_CLASSES] = {
     table
 };
 
-/// Compute offset / slot_size without hardware division using magic multiplier.
+/// Shift amounts for power-of-2 size classes. Non-power-of-2 entries are 0xFF.
+/// For power-of-2 classes, slot_index = offset >> shift (1 cycle vs 4 for magic multiply).
+static SLOT_SHIFT: [u8; NUM_SIZE_CLASSES] = {
+    let mut table = [0xFFu8; NUM_SIZE_CLASSES];
+    let mut i = 0;
+    while i < NUM_SIZE_CLASSES {
+        let sz = SIZE_CLASSES[i];
+        if sz & (sz - 1) == 0 {
+            // Power of 2
+            table[i] = sz.trailing_zeros() as u8;
+        }
+        i += 1;
+    }
+    table
+};
+
+/// Compute offset / slot_size. Uses shift for power-of-2 sizes (~1 cycle)
+/// or magic multiply for others (~4 cycles). Replaces ~25-cycle hardware div.
 #[inline(always)]
 pub fn fast_div_slot(offset: usize, class_index: usize) -> usize {
-    let magic = SLOT_MAGIC[class_index];
-    ((offset as u128 * magic as u128) >> 64) as usize
+    let shift = SLOT_SHIFT[class_index];
+    if shift != 0xFF {
+        offset >> shift
+    } else {
+        let magic = SLOT_MAGIC[class_index];
+        ((offset as u128 * magic as u128) >> 64) as usize
+    }
 }
 
 /// Precomputed slots-per-slab table. Eliminates a ~35-cycle hardware division

@@ -107,9 +107,12 @@ pub unsafe fn allocator() -> &'static HardenedAllocator {
     &*ALLOCATOR.0.get()
 }
 
+/// Check init state. Uses Relaxed ordering: on x86 all loads are naturally
+/// ordered, and the init state is set once during init (which happens-before
+/// any allocation via the constructor/ensure_initialized path).
 #[inline(always)]
 pub fn state() -> u8 {
-    INIT_STATE.load(Ordering::Acquire)
+    INIT_STATE.load(Ordering::Relaxed)
 }
 
 pub const STATE_READY: u8 = READY;
