@@ -8,8 +8,14 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use guard::LargeAlloc;
 
+use crate::util::{align_up, page_size};
+
 /// Hash table capacity for large allocations. Must be a power of two.
 const LARGE_TABLE_CAPACITY: usize = 4096;
+
+/// Maximum cached mappings for reuse. Eliminates mmap/munmap/mprotect syscalls
+/// in steady-state allocation patterns.
+const MAPPING_CACHE_SIZE: usize = 16;
 
 #[derive(Clone, Copy)]
 struct LargeEntry {
@@ -33,9 +39,31 @@ impl LargeEntry {
     }
 }
 
+/// A cached VMA mapping available for reuse.
+/// Guard pages remain PROT_NONE; data pages have been MADV_DONTNEED'd.
+#[derive(Clone, Copy)]
+struct CachedMapping {
+    base: *mut u8,
+    total_size: usize,
+    data_size: usize,
+}
+
+impl CachedMapping {
+    const fn empty() -> Self {
+        CachedMapping {
+            base: ptr::null_mut(),
+            total_size: 0,
+            data_size: 0,
+        }
+    }
+}
+
 struct LargeInner {
     entries: [LargeEntry; LARGE_TABLE_CAPACITY],
     count: usize,
+    /// Mapping cache: reusable VMAs with guard pages intact.
+    mapping_cache: [CachedMapping; MAPPING_CACHE_SIZE],
+    mapping_cache_count: usize,
 }
 
 pub struct LargeAllocator {
@@ -63,11 +91,14 @@ impl LargeAllocator {
     #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         const EMPTY: LargeEntry = LargeEntry::empty();
+        const EMPTY_MAPPING: CachedMapping = CachedMapping::empty();
         LargeAllocator {
             lock: RawMutex::new(),
             inner: UnsafeCell::new(LargeInner {
                 entries: [EMPTY; LARGE_TABLE_CAPACITY],
                 count: 0,
+                mapping_cache: [EMPTY_MAPPING; MAPPING_CACHE_SIZE],
+                mapping_cache_count: 0,
             }),
         }
     }
@@ -83,6 +114,54 @@ impl LargeAllocator {
     /// # Safety
     /// Caller must ensure the allocator has been initialized.
     pub unsafe fn alloc(&self, size: usize, metadata: &MetadataTable) -> *mut u8 {
+        let data_size = align_up(size, page_size());
+
+        #[cfg(feature = "guard-pages")]
+        let needed_total = page_size() + data_size + page_size();
+        #[cfg(not(feature = "guard-pages"))]
+        let needed_total = data_size;
+
+        // Try mapping cache first (single lock acquisition for check + hash insert)
+        self.lock.lock();
+        let inner = &mut *self.inner.get();
+        if let Some(mapping) = Self::pop_cached(inner, needed_total) {
+            #[cfg(feature = "guard-pages")]
+            let user_ptr = mapping.base.add(page_size());
+            #[cfg(not(feature = "guard-pages"))]
+            let user_ptr = mapping.base;
+
+            let entry = LargeEntry {
+                key: user_ptr as usize,
+                base: mapping.base,
+                total_size: mapping.total_size,
+                data_size: mapping.data_size,
+                requested_size: size,
+            };
+            let stored = Self::insert_entry(inner, entry);
+            self.lock.unlock();
+
+            if !stored {
+                platform::unmap(mapping.base, mapping.total_size);
+                return ptr::null_mut();
+            }
+
+            page_map::register_large(user_ptr, mapping.data_size);
+
+            #[cfg(feature = "canaries")]
+            {
+                let canary = crate::hardening::canary::generate_canary(user_ptr);
+                metadata.insert(user_ptr, AllocationMeta::new(size, canary));
+            }
+            #[cfg(not(feature = "canaries"))]
+            {
+                metadata.insert(user_ptr, AllocationMeta::new(size, 0));
+            }
+
+            return user_ptr;
+        }
+        self.lock.unlock();
+
+        // Cache miss: create new mapping (mmap + mprotect)
         let alloc = match LargeAlloc::create(size) {
             Some(a) => a,
             None => return ptr::null_mut(),
@@ -118,7 +197,6 @@ impl LargeAllocator {
             return ptr::null_mut();
         }
 
-        // Register in page map for O(1) lookup
         page_map::register_large(user_ptr, alloc.data_size);
 
         user_ptr
@@ -152,13 +230,18 @@ impl LargeAllocator {
                 let total_size = entry.total_size;
                 let data_size = entry.data_size;
 
-                // Remove entry and rehash
+                // Remove entry from hash table
                 Self::remove_at(inner, idx);
+
+                // Cache the mapping for reuse. No MADV_DONTNEED here — the VMA
+                // keeps its physical pages for fast reuse (matching glibc behavior).
+                // Physical pages are only released on eviction or when the cache
+                // is cleaned up. Guard pages remain PROT_NONE throughout.
+                Self::push_cached(inner, CachedMapping { base, total_size, data_size });
                 self.lock.unlock();
 
-                // Unregister from page map before unmapping
+                // Unregister from page map (lock-free atomic stores)
                 page_map::unregister_large(ptr, data_size);
-                platform::unmap(base, total_size);
                 return true;
             }
             if entry.key == 0 {
@@ -198,6 +281,66 @@ impl LargeAllocator {
         let result = Self::lookup_entry(inner, ptr).map(|e| e.requested_size);
         self.lock.unlock();
         result
+    }
+
+    // ========================================================================
+    // Mapping cache operations (caller must hold lock)
+    // ========================================================================
+
+    /// Pop a cached mapping with total_size >= needed. Prefers exact match,
+    /// then smallest fit. Returns None if no suitable mapping is cached.
+    unsafe fn pop_cached(inner: &mut LargeInner, needed_total: usize) -> Option<CachedMapping> {
+        let count = inner.mapping_cache_count;
+        if count == 0 {
+            return None;
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_size = usize::MAX;
+        for i in 0..count {
+            let ts = inner.mapping_cache[i].total_size;
+            if ts >= needed_total && ts < best_size {
+                best_size = ts;
+                best_idx = Some(i);
+                if ts == needed_total {
+                    break; // exact match
+                }
+            }
+        }
+        let idx = best_idx?;
+        let mapping = inner.mapping_cache[idx];
+        // Swap-remove: replace with last entry
+        inner.mapping_cache_count -= 1;
+        if idx < inner.mapping_cache_count {
+            inner.mapping_cache[idx] = inner.mapping_cache[inner.mapping_cache_count];
+        }
+        Some(mapping)
+    }
+
+    /// Push a mapping into the cache. If full, evicts the smallest cached
+    /// mapping (munmaps it) to make room, keeping larger mappings cached
+    /// since they're more expensive to recreate.
+    unsafe fn push_cached(inner: &mut LargeInner, mapping: CachedMapping) {
+        if inner.mapping_cache_count < MAPPING_CACHE_SIZE {
+            inner.mapping_cache[inner.mapping_cache_count] = mapping;
+            inner.mapping_cache_count += 1;
+            return;
+        }
+        // Cache full: find the smallest entry to evict
+        let mut smallest_idx = 0;
+        for i in 1..MAPPING_CACHE_SIZE {
+            if inner.mapping_cache[i].total_size < inner.mapping_cache[smallest_idx].total_size {
+                smallest_idx = i;
+            }
+        }
+        if mapping.total_size >= inner.mapping_cache[smallest_idx].total_size {
+            // Evict the smallest, cache our (larger or equal) mapping
+            let evict = inner.mapping_cache[smallest_idx];
+            inner.mapping_cache[smallest_idx] = mapping;
+            platform::unmap(evict.base, evict.total_size);
+        } else {
+            // Our mapping is the smallest — just unmap it
+            platform::unmap(mapping.base, mapping.total_size);
+        }
     }
 
     // ========================================================================

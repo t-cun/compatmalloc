@@ -274,7 +274,7 @@ impl PageMap {
         if l2.is_null() {
             return None;
         }
-        let packed = (*l2).entries[l2_idx].load(Ordering::Relaxed);
+        let packed = (*l2).entries[l2_idx].load(Ordering::Acquire);
         unpack(packed)
     }
 }

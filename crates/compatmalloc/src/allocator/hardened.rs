@@ -884,10 +884,11 @@ impl HardenedAllocator {
         let ptr = self.malloc(total);
         if !ptr.is_null() {
             // Optimization: skip zeroing for fresh mmap pages that haven't been freed.
+            // Large allocs may come from the mapping cache (dirty pages), so
+            // they always need zeroing. Only fresh slab pages can skip.
             let needs_zeroing = if let Some(info) = page_map::lookup(ptr) {
                 if info.is_large() {
-                    // Large allocations are always fresh mmap pages
-                    false
+                    true
                 } else {
                     // Check if the slab has ever had slots freed
                     let arena_idx = info.arena_index as usize;

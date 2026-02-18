@@ -113,14 +113,6 @@ impl ClassCache {
         self.free_count >= FREE_CACHE_SIZE
     }
 
-    /// Drain all deferred frees into a buffer. Returns the count.
-    fn drain_frees(&mut self, buf: &mut [CachedSlot; FREE_CACHE_SIZE]) -> usize {
-        let count = self.free_count;
-        buf[..count].copy_from_slice(&self.free_slots[..count]);
-        self.free_count = 0;
-        count
-    }
-
     /// Recycle entries from the free buffer to the alloc cache.
     /// Returns the number of entries remaining in the free buffer (for arena flush).
     /// Moves up to `max_recycle` entries from free to alloc. Remaining entries
@@ -147,17 +139,6 @@ impl ClassCache {
         start // remaining in free buffer
     }
 
-    /// Drain half the alloc cache into a buffer, returning the number drained.
-    fn drain_half(&mut self, buf: &mut [CachedSlot; CACHE_SIZE]) -> usize {
-        let to_drain = self.alloc_count / 2;
-        if to_drain == 0 {
-            return 0;
-        }
-        let new_count = self.alloc_count - to_drain;
-        buf[..to_drain].copy_from_slice(&self.alloc_slots[new_count..new_count + to_drain]);
-        self.alloc_count = new_count;
-        to_drain
-    }
 }
 
 /// Thread-local cache for all size classes.
@@ -212,20 +193,6 @@ impl ThreadCache {
         self.caches[class_index].recycle_frees_to_alloc(max_recycle)
     }
 
-    /// Drain all deferred frees for a size class. Returns (buffer, count).
-    pub fn drain_frees(&mut self, class_index: usize) -> ([CachedSlot; FREE_CACHE_SIZE], usize) {
-        let mut buf = [CachedSlot {
-            ptr: core::ptr::null_mut(),
-            slab_ptr: core::ptr::null_mut(),
-            slot_index: 0,
-            arena_index: 0,
-            _pad: 0,
-            cached_size: 0,
-        }; FREE_CACHE_SIZE];
-        let count = self.caches[class_index].drain_frees(&mut buf);
-        (buf, count)
-    }
-
     /// Get a reference to the free buffer and its count, then reset the count.
     /// Avoids copying the 1536-byte buffer to the caller's stack frame.
     #[inline(always)]
@@ -236,19 +203,6 @@ impl ThreadCache {
         (&cache.free_slots[..count], count)
     }
 
-    /// Drain half the alloc entries for a size class. Returns (buffer, count).
-    pub fn drain_half(&mut self, class_index: usize) -> ([CachedSlot; CACHE_SIZE], usize) {
-        let mut buf = [CachedSlot {
-            ptr: core::ptr::null_mut(),
-            slab_ptr: core::ptr::null_mut(),
-            slot_index: 0,
-            arena_index: 0,
-            _pad: 0,
-            cached_size: 0,
-        }; CACHE_SIZE];
-        let count = self.caches[class_index].drain_half(&mut buf);
-        (buf, count)
-    }
 }
 
 /// Consolidated thread-local state: cache + thread ID + RNG + page map MRU.
@@ -536,50 +490,6 @@ where
     Some(result)
 }
 
-/// Fast free-path TLS access: skips the reentrancy guard since free() cannot
-/// recurse into allocation code. Saves ~4-5 cycles per free.
-///
-/// SAFETY: Only call from free paths that cannot recurse into malloc/realloc.
-#[inline(always)]
-fn with_thread_state_for_free<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut ThreadState) -> R,
-{
-    let state = unsafe { get_thread_state_ptr() };
-    if state.is_null() {
-        return None;
-    }
-    let state = unsafe { &mut *state };
-    debug_assert!(!state.active, "reentrant free detected — this is a bug");
-    state.check_fork_generation();
-    Some(f(state))
-}
-
-/// Access the thread-local cache. Returns None if TLS is not available
-/// (e.g., during very early init or thread destruction).
-/// Thin wrapper around with_thread_state for backward compatibility.
-#[inline(always)]
-pub fn with_thread_cache<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut ThreadCache) -> R,
-{
-    with_thread_state(|state| f(&mut state.cache))
-}
-
-/// Access both the thread-local cache and thread ID in a single TLS access.
-/// Avoids the reentrant TLS fallback that occurs when select_arena() is called
-/// inside a with_thread_cache() closure.
-#[inline(always)]
-pub fn with_cache_and_tid<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut ThreadCache, usize) -> R,
-{
-    with_thread_state(|state| {
-        let tid = state.thread_id();
-        f(&mut state.cache, tid)
-    })
-}
-
 /// Access cache, arena index, and thread ID.
 /// Arena index is cached per-thread (computed once per thread lifetime).
 #[inline(always)]
@@ -591,49 +501,6 @@ where
         let tid = state.thread_id();
         let arena_idx = state.arena_index(num_arenas);
         f(&mut state.cache, tid, arena_idx)
-    })
-}
-
-/// Combined free fast path: single TLS access for page map MRU + free buffer push.
-/// Checks the MRU cache first (1 cycle). On miss, falls back to radix lookup and
-/// updates MRU. Calls `on_slab_free` with (ptr, slab_ptr, arena_index, class_index, cache).
-/// Returns None if TLS unavailable, Some(false) if not a slab free, Some(true) if handled.
-///
-/// Uses the fast free-path TLS accessor (no reentrancy guard) because free()
-/// cannot recurse into allocation code.
-#[inline(always)]
-pub fn try_free_fast<F>(ptr: *mut u8, on_slab_free: F) -> Option<bool>
-where
-    F: FnOnce(*mut u8, *mut u8, u8, u8, &mut ThreadCache) -> bool,
-{
-    with_thread_state_for_free(|state| {
-        let page = ptr as usize >> 12;
-        let info = if state.mru_valid && state.mru_page == page {
-            // MRU hit: skip radix lookup
-            Some((state.mru_slab_ptr, state.mru_arena_index, state.mru_class_index))
-        } else {
-            // MRU miss: radix lookup
-            // SAFETY: ptr is a user-provided pointer; lookup reads from the
-            // initialized page map (atomic loads only).
-            match unsafe { crate::slab::page_map::lookup(ptr) } {
-                Some(i) if !i.is_large() => {
-                    state.mru_page = page;
-                    state.mru_slab_ptr = i.slab_ptr;
-                    state.mru_arena_index = i.arena_index;
-                    state.mru_class_index = i.class_index;
-                    state.mru_valid = true;
-                    Some((i.slab_ptr, i.arena_index, i.class_index))
-                }
-                _ => None,
-            }
-        };
-
-        match info {
-            Some((slab_ptr, arena_index, class_index)) => {
-                on_slab_free(ptr, slab_ptr, arena_index, class_index, &mut state.cache)
-            }
-            None => false,
-        }
     })
 }
 

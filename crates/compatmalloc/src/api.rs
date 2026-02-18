@@ -30,14 +30,23 @@ macro_rules! dispatch {
 // Standard C allocator API
 // ============================================================================
 
+/// Set errno to ENOMEM and return null on allocation failure.
+#[inline(always)]
+unsafe fn enomem_on_null(ptr: *mut c_void) -> *mut c_void {
+    if ptr.is_null() {
+        *libc::__errno_location() = libc::ENOMEM;
+    }
+    ptr
+}
+
 /// # Safety
 /// Standard C malloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().malloc(size) as *mut c_void,
         passthrough::malloc(size) as *mut c_void
-    )
+    ))
 }
 
 /// # Safety
@@ -57,20 +66,20 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
 /// `ptr` must be null or previously returned by an allocation function.
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().realloc(ptr as *mut u8, size) as *mut c_void,
         passthrough::realloc(ptr as *mut u8, size) as *mut c_void
-    )
+    ))
 }
 
 /// # Safety
 /// Standard C calloc semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().calloc(nmemb, size) as *mut c_void,
         passthrough::calloc(nmemb, size) as *mut c_void
-    )
+    ))
 }
 
 // ============================================================================
@@ -117,20 +126,20 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
         return ptr::null_mut();
     }
 
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().memalign(alignment, size) as *mut c_void,
         passthrough::memalign(alignment, size) as *mut c_void
-    )
+    ))
 }
 
 /// # Safety
 /// Standard memalign semantics apply.
 #[no_mangle]
 pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().memalign(alignment, size) as *mut c_void,
         passthrough::memalign(alignment, size) as *mut c_void
-    )
+    ))
 }
 
 /// # Safety
@@ -138,10 +147,10 @@ pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void 
 #[no_mangle]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     let ps = crate::util::page_size();
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().memalign(ps, size) as *mut c_void,
         passthrough::memalign(ps, size) as *mut c_void
-    )
+    ))
 }
 
 /// # Safety
@@ -150,10 +159,10 @@ pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
     let ps = crate::util::page_size();
     let rounded = crate::util::align_up(size, ps);
-    dispatch!(
+    enomem_on_null(dispatch!(
         init::allocator().memalign(ps, rounded) as *mut c_void,
         passthrough::memalign(ps, rounded) as *mut c_void
-    )
+    ))
 }
 
 // ============================================================================
