@@ -322,20 +322,6 @@ impl ThreadState {
 // The primary hot path uses the inline asm below.
 // ---------------------------------------------------------------------------
 
-// Define a TLS variable in .tbss with initial-exec model (via assembly).
-// This variable lives in the thread-local storage block and is accessed
-// via %fs: segment on x86-64 Linux.
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".section .tbss,\"awT\",@nobits",
-    ".align 8",
-    ".type _cm_tls_state, @tls_object",
-    ".size _cm_tls_state, 8",
-    "_cm_tls_state:",
-    ".zero 8",
-    ".section .text",
-);
-
 /// Read the TLS state pointer directly via %fs: segment (no function call).
 /// On x86-64 Linux with initial-exec TLS, this is 2 instructions:
 ///   mov rax, [rip + _cm_tls_state@GOTTPOFF]  (load TLS offset from GOT)

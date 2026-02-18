@@ -24,11 +24,19 @@ fn main() {
                 .flag("-ftls-model=initial-exec")
                 .flag("-fvisibility=hidden");
 
-            // Use clang-21 with thin LTO for cross-language LTO if available
-            if std::process::Command::new("clang-21")
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
+            // Cross-language LTO (release only): use clang-21 + thin LTO so lld
+            // can merge C and Rust bitcode, enabling cross-boundary inlining.
+            // In debug/test builds we use the default compiler (gcc) to produce
+            // native ELF -- the cc crate auto-adds -flto=thin when it sees
+            // -Clinker-plugin-lto in CARGO_ENCODED_RUSTFLAGS and the compiler
+            // is clang, which produces bitcode TLS variables that lld doesn't
+            // properly materialize without full LTO.
+            let profile = std::env::var("PROFILE").unwrap_or_default();
+            if profile == "release"
+                && std::process::Command::new("clang-21")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|o| o.status.success())
             {
                 build.compiler("clang-21");
                 build.flag("-flto=thin");

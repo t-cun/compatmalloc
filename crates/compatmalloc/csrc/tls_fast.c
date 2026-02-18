@@ -11,15 +11,15 @@
 
 #include <stddef.h>
 
-static __thread void *_tls_state
+__thread void *_cm_tls_state
     __attribute__((tls_model("initial-exec"))) = (void *)0;
 
 __attribute__((visibility("hidden")))
 void *compatmalloc_tls_get(void) {
-    return _tls_state;
+    return _cm_tls_state;
 }
 
 __attribute__((visibility("hidden")))
 void compatmalloc_tls_set(void *ptr) {
-    _tls_state = ptr;
+    _cm_tls_state = ptr;
 }
