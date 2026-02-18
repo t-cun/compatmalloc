@@ -27,3 +27,10 @@
 # Performance
 
 - [Benchmarks](./benchmarks.md)
+
+# Security
+
+- [CVE Case Studies](./cve-case-studies/overview.md)
+  - [CVE-2024-2961: iconv Buffer Overflow](./cve-case-studies/cve-2024-2961.md)
+  - [CVE-2023-6246: syslog Heap Overflow](./cve-case-studies/cve-2023-6246.md)
+  - [Double-Free Detection](./cve-case-studies/double-free.md)

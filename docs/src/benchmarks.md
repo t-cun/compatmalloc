@@ -117,3 +117,5 @@ When benchmarking allocators, keep the following in mind:
 2. **Test with realistic workloads.** Microbenchmarks of `malloc`/`free` loops do not represent real application behavior.
 3. **Measure RSS, not just time.** Hardening features (quarantine, guard pages) increase resident memory. Use `getrusage` or `/proc/self/status` to measure `VmRSS`.
 4. **Account for variance.** Run benchmarks multiple times and report medians. Allocator performance can be sensitive to ASLR and system load.
+5. **Best-of-3 selection.** CI results use the minimum latency and maximum throughput from 3 runs. This filters out noise from shared infrastructure while reflecting the allocator's true capability.
+6. **Compare against other allocators.** The comparison table includes jemalloc and mimalloc (performance-focused) alongside scudo (hardened, like compatmalloc). This provides context for the overhead of hardening features.
