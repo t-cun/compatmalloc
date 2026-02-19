@@ -40,6 +40,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('crates/**', 'fuzz/**') }}
 
       - name: Install clang-21 and lld-21
         run: |
