@@ -584,8 +584,6 @@ impl HardenedAllocator {
             let class_idx = slab.class_index;
             let slot_sz = crate::slab::size_class::slot_size(class_idx);
             let slot_base = slab.data.add(slot_idx * slot_sz);
-            let user_ptr = cached.ptr;
-
             // Verify integrity checksum (mask out freed bit)
             let flags_masked = meta.flags.load(core::sync::atomic::Ordering::Relaxed) & !0x01;
             if !crate::hardening::integrity::verify_checksum(
@@ -602,6 +600,7 @@ impl HardenedAllocator {
             // Verify canary bytes
             #[cfg(feature = "canaries")]
             {
+                let user_ptr = cached.ptr;
                 let front_gap = user_ptr as usize - slot_base as usize;
                 if front_gap > 0
                     && !crate::hardening::canary::check_canary_front(
@@ -810,6 +809,16 @@ impl HardenedAllocator {
                                         let copy_size = old_size.min(new_size);
                                         // memmove-safe since src/dst may overlap
                                         core::ptr::copy(ptr, new_user_ptr, copy_size);
+                                    }
+                                    // Clear stale canary bytes in newly exposed region (growing).
+                                    // Must happen AFTER copy to avoid destroying user data.
+                                    #[cfg(feature = "canaries")]
+                                    if new_size > old_size {
+                                        core::ptr::write_bytes(
+                                            new_user_ptr.add(old_size),
+                                            0,
+                                            new_size - old_size,
+                                        );
                                     }
                                     return new_user_ptr;
                                 }

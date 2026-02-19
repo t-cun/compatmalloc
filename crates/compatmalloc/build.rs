@@ -4,19 +4,22 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            let script = format!("{}/linker/version_script.lds", manifest_dir);
-            println!(
-                "cargo:rustc-cdylib-link-arg=-Wl,--version-script={}",
-                script
-            );
-            println!("cargo:rerun-if-changed=linker/version_script.lds");
+            // Version script to export only malloc-family symbols.
+            // Skip in fuzz builds: nightly rustc generates its own version
+            // script for cdylib targets, and anonymous + named tags conflict.
+            let is_fuzzing = std::env::var("CARGO_CFG_FUZZING").is_ok();
+            if !is_fuzzing {
+                let script = format!("{}/linker/version_script.lds", manifest_dir);
+                println!(
+                    "cargo:rustc-cdylib-link-arg=-Wl,--version-script={}",
+                    script
+                );
+                println!("cargo:rerun-if-changed=linker/version_script.lds");
+            }
 
             // Compile C shim for fast TLS access (initial-exec model).
             // This gives us direct fs: segment loads (~1-3 cycles) instead of
             // __tls_get_addr PLT calls (~25 cycles).
-            //
-            // Cross-language LTO (clang-21 + lld-21): compiles C to LLVM bitcode
-            // which lld merges with Rust bitcode, enabling cross-boundary inlining.
             let mut build = cc::Build::new();
             build
                 .file(format!("{}/csrc/tls_fast.c", manifest_dir))
@@ -24,22 +27,24 @@ fn main() {
                 .flag("-ftls-model=initial-exec")
                 .flag("-fvisibility=hidden");
 
-            // Cross-language LTO (release only): use clang-21 + thin LTO so lld
-            // can merge C and Rust bitcode, enabling cross-boundary inlining.
-            // In debug/test builds we use the default compiler (gcc) to produce
-            // native ELF -- the cc crate auto-adds -flto=thin when it sees
-            // -Clinker-plugin-lto in CARGO_ENCODED_RUSTFLAGS and the compiler
-            // is clang, which produces bitcode TLS variables that lld doesn't
-            // properly materialize without full LTO.
-            let profile = std::env::var("PROFILE").unwrap_or_default();
-            if profile == "release"
-                && std::process::Command::new("clang-21")
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|o| o.status.success())
+            // Use clang-21 when available for consistent codegen with lld-21.
+            // Cross-language LTO (-flto=thin) is only enabled when the caller
+            // sets -Clinker-plugin-lto in RUSTFLAGS (release/bench builds).
+            // The cc crate auto-detects this and adds -flto=thin; we also add
+            // it explicitly for clarity.
+            let has_lto = std::env::var("CARGO_ENCODED_RUSTFLAGS")
+                .map(|f| f.contains("linker-plugin-lto"))
+                .unwrap_or(false);
+
+            if std::process::Command::new("clang-21")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
             {
                 build.compiler("clang-21");
-                build.flag("-flto=thin");
+                if has_lto {
+                    build.flag("-flto=thin");
+                }
             }
 
             build.compile("tls_fast");

@@ -48,6 +48,8 @@ jobs:
 
       - name: Build release library
         run: cargo build --release
+        env:
+          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto"
 
       - name: Verify library exists
         run: test -f target/release/libcompatmalloc.so

@@ -658,13 +658,11 @@ impl Arena {
         let gap = crate::util::align_down(slot_sz - aligned_size, align);
         let user_ptr = slot_base_ptr.add(gap);
 
-        // When canaries are enabled and the alignment/gap changes between
-        // allocations in the same slot, stale canary bytes from the previous
-        // layout may fall anywhere in the slot. Zero the entire slot to be safe.
-        #[cfg(feature = "canaries")]
-        {
-            core::ptr::write_bytes(slot_base_ptr, 0, slot_sz);
-        }
+        // NOTE: we intentionally do NOT zero the entire slot here.
+        // The canary writes below overwrite the gap regions, and the user
+        // region is either uninitialized (fresh alloc) or preserved by the
+        // caller (realloc copies data after this function returns).
+        // Zeroing the full slot would destroy user data during in-place realloc.
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);

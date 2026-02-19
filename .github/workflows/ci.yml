@@ -68,6 +68,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo build --workspace --release
+        env:
+          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto"
       - name: Verify cdylib exists
         run: test -f target/release/libcompatmalloc.so
       - name: Upload release artifact
