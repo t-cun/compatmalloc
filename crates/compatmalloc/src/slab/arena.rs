@@ -623,6 +623,20 @@ impl Arena {
         // gap is zero, user_ptr == slot_base. Skip alignment/gap computation.
         let aligned_size = align_up(size, crate::util::MIN_ALIGN);
         if aligned_size >= slot_sz {
+            // When canaries are enabled, clear stale canary bytes that may
+            // persist from a previous smaller allocation in this slot.
+            // During in-place realloc (same size class, growing), the old
+            // canary at [old_req, slot_sz) partially overlaps the new user
+            // region [0, size). Zero only the affected range [old_req, size).
+            #[cfg(feature = "canaries")]
+            {
+                let old_req = meta.requested_size.get() as usize;
+                if old_req > 0 && old_req < size && old_req < slot_sz {
+                    let clear_start = slot_base_ptr.add(old_req);
+                    let clear_len = size - old_req;
+                    core::ptr::write_bytes(clear_start, 0, clear_len);
+                }
+            }
             meta.requested_size_store(size as u32);
             meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
             let checksum = crate::hardening::integrity::compute_checksum(
@@ -643,6 +657,14 @@ impl Arena {
         // Slow path: compute gap for right-alignment and canary regions
         let gap = crate::util::align_down(slot_sz - aligned_size, align);
         let user_ptr = slot_base_ptr.add(gap);
+
+        // When canaries are enabled and the alignment/gap changes between
+        // allocations in the same slot, stale canary bytes from the previous
+        // layout may fall anywhere in the slot. Zero the entire slot to be safe.
+        #[cfg(feature = "canaries")]
+        {
+            core::ptr::write_bytes(slot_base_ptr, 0, slot_sz);
+        }
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
