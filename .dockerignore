@@ -1,0 +1,9 @@
+target/
+.git/
+docs/
+fuzz/
+benches/
+tests/
+*.md
+.github/
+.claude/

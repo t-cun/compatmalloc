@@ -1,0 +1,26 @@
+# Maintainer: compatmalloc contributors
+pkgname=compatmalloc
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A drop-in memory-hardening allocator for Linux, written in Rust"
+arch=('x86_64' 'aarch64')
+url="https://github.com/t-cun/compatmalloc"
+license=('MIT' 'Apache-2.0')
+makedepends=('rust' 'clang' 'lld')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    RUSTFLAGS="-Clink-arg=-fuse-ld=lld" \
+        cargo build --workspace --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/libcompatmalloc.so" \
+        "$pkgdir/usr/lib/libcompatmalloc.so"
+
+    install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

@@ -136,6 +136,7 @@ jobs:
           - poison-on-free
           - write-after-free-check
           - zero-on-free
+          - global-allocator
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
