@@ -11,7 +11,7 @@
 Clone the repository and build the release library:
 
 ```bash
-git clone https://github.com/user/compatmalloc.git
+git clone https://github.com/t-cun/compatmalloc.git
 cd compatmalloc
 cargo build --release
 ```

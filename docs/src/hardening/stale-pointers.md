@@ -14,7 +14,7 @@ When memory is freed, it is not immediately returned to the slab allocator's fre
 
 Without quarantine, a freed slot can be immediately reused by the next `malloc` of the same size class. An attacker can trigger this reliably by controlling the timing of allocations and frees. With quarantine:
 
-1. **Temporal separation.** Thousands of frees must occur before a specific slot is reused, making timing-based heap grooming attacks much harder.
+1. **Temporal separation.** Hundreds of frees must occur before a specific slot is reused, making timing-based heap grooming attacks much harder.
 
 2. **Write-after-free detection window.** While memory is in quarantine, it remains poisoned. If anything writes to it during this window, the poison check on eviction will detect the corruption.
 
@@ -22,7 +22,7 @@ Without quarantine, a freed slot can be immediately reused by the next `malloc` 
 
 ## Implementation
 
-The quarantine (`hardening::quarantine::Quarantine`) is a fixed-capacity ring buffer with 8,192 slots, protected by a raw mutex.
+The quarantine (`hardening::quarantine::Quarantine`) is a fixed-capacity ring buffer with 256 slots per arena, protected by the arena lock.
 
 ```
                   head                        tail
@@ -37,7 +37,7 @@ The quarantine (`hardening::quarantine::Quarantine`) is a fixed-capacity ring bu
 Entries are evicted when either condition is met:
 
 1. **Byte budget exceeded.** The total bytes in quarantine plus the new entry would exceed `max_bytes`. Oldest entries are evicted until the budget is satisfied.
-2. **Slot count exceeded.** The ring buffer is full (8,192 entries). The oldest entry is evicted.
+2. **Slot count exceeded.** The ring buffer is full (256 entries). The oldest entry is evicted.
 
 The byte budget defaults to **4 MiB** (`DEFAULT_QUARANTINE_BYTES`) and can be configured via the `COMPATMALLOC_QUARANTINE_SIZE` environment variable.
 
@@ -51,7 +51,7 @@ When an entry is evicted from quarantine:
 
 ### Concurrency
 
-The quarantine has its own mutex, separate from the slab arena locks and the metadata table lock. A `free` call acquires the quarantine lock only briefly to push one entry and potentially pop one evicted entry.
+The quarantine is embedded in each arena and protected by the arena lock. No separate quarantine lock is needed. A `free` call pushes one entry and potentially evicts older entries while the arena lock is held.
 
 ## Configuration
 

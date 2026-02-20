@@ -34,8 +34,9 @@ jobs:
 
       - name: Install clang-21 and lld-21
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          CODENAME=$(lsb_release -cs)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang-21 lld-21
 
@@ -51,7 +52,8 @@ jobs:
       - name: Build release library
         run: cargo build --release
         env:
-          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto"
+          CC: clang-21
+          RUSTFLAGS: "-Clinker=clang-21 -Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto"
 
       - name: Verify library exists
         run: test -f target/release/libcompatmalloc.so
@@ -123,14 +125,26 @@ jobs:
           # Save full output from the best run
           echo "$best_output" > "bench-${NAME}.txt"
 
+          # Measure peak RSS with a single extra run
+          echo "  measuring peak RSS..."
+          rss_cmd=(/usr/bin/time -v)
+          if [ -n "$PRELOAD" ] || [ -n "$ENV_EXTRA" ]; then
+              rss_cmd+=(env)
+              [ -n "$PRELOAD" ] && rss_cmd+=(LD_PRELOAD="$PRELOAD")
+              [ -n "$ENV_EXTRA" ] && rss_cmd+=("$ENV_EXTRA")
+          fi
+          rss_output=$( ALLOCATOR_NAME="$NAME" "${rss_cmd[@]}" "$BINARY" 2>&1 ) || true
+          rss_kb=$(echo "$rss_output" | grep "Maximum resident" | sed 's/.*: *//' || echo "0")
+          echo "  peak RSS: ${rss_kb} KB"
+
           # Extract fields and write best-of-3 summary
           if [ -n "$best_summary" ]; then
               lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
               t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
               t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
-              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}" > "bench-${NAME}-best.txt"
+              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
           else
-              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0" > "bench-${NAME}-best.txt"
+              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0|rss_kb=0" > "bench-${NAME}-best.txt"
           fi
           HELPER
           chmod +x /tmp/run_best_of_3.sh
@@ -229,6 +243,7 @@ jobs:
             lat=$(parse_best "bench-${name}-best.txt" "latency_64")
             t1=$(parse_best "bench-${name}-best.txt" "throughput_1t")
             t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
+            rss=$(parse_best "bench-${name}-best.txt" "rss_kb")
 
             # Compute ratios vs glibc
             if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
@@ -247,7 +262,7 @@ jobs:
               t4_ratio="?"
             fi
 
-            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x |
+            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
           "
           done
 
@@ -274,13 +289,15 @@ jobs:
 
           ### Multi-Allocator Comparison
 
-          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio |
-          |-----------|------------:|------:|--------------:|------:|--------------:|------:|
+          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
+          |-----------|------------:|------:|--------------:|------:|--------------:|------:|---------:|
           ${table_rows}
 
           > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
           >
           > **Hardened allocators:** compatmalloc, scudo. These have security features (guard pages, quarantine, etc.) that add overhead vs. pure-performance allocators.
+          >
+          > **Peak RSS** measured via \`/usr/bin/time -v\` during a single benchmark run. Hardening features (quarantine, guard pages) increase memory usage.
 
           ### malloc/free Latency by Size (glibc)
 
@@ -419,13 +436,25 @@ jobs:
 
           echo "$best_output" > "bench-${NAME}.txt"
 
+          # Measure peak RSS with a single extra run
+          echo "  measuring peak RSS..."
+          rss_cmd=(/usr/bin/time -v)
+          if [ -n "$PRELOAD" ] || [ -n "$ENV_EXTRA" ]; then
+              rss_cmd+=(env)
+              [ -n "$PRELOAD" ] && rss_cmd+=(LD_PRELOAD="$PRELOAD")
+              [ -n "$ENV_EXTRA" ] && rss_cmd+=("$ENV_EXTRA")
+          fi
+          rss_output=$( ALLOCATOR_NAME="$NAME" "${rss_cmd[@]}" "$BINARY" 2>&1 ) || true
+          rss_kb=$(echo "$rss_output" | grep "Maximum resident" | sed 's/.*: *//' || echo "0")
+          echo "  peak RSS: ${rss_kb} KB"
+
           if [ -n "$best_summary" ]; then
               lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
               t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
               t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
-              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}" > "bench-${NAME}-best.txt"
+              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
           else
-              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0" > "bench-${NAME}-best.txt"
+              echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0|rss_kb=0" > "bench-${NAME}-best.txt"
           fi
           HELPER
           chmod +x /tmp/run_best_of_3.sh
@@ -495,6 +524,7 @@ jobs:
             lat=$(parse_best "bench-${name}-best.txt" "latency_64")
             t1=$(parse_best "bench-${name}-best.txt" "throughput_1t")
             t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
+            rss=$(parse_best "bench-${name}-best.txt" "rss_kb")
 
             if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
               lat_ratio=$(echo "scale=2; $lat / $g_lat" | bc 2>/dev/null || echo "?")
@@ -512,7 +542,7 @@ jobs:
               t4_ratio="?"
             fi
 
-            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x |
+            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
           "
           done
 
@@ -524,11 +554,13 @@ jobs:
 
           ### Multi-Allocator Comparison (ARM64)
 
-          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio |
-          |-----------|------------:|------:|--------------:|------:|--------------:|------:|
+          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
+          |-----------|------------:|------:|--------------:|------:|--------------:|------:|---------:|
           ${table_rows}
 
           > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
+          >
+          > **Peak RSS** measured via \`/usr/bin/time -v\` during a single benchmark run. Hardening features (quarantine, guard pages) increase memory usage.
 
           ### malloc/free Latency by Size - ARM64 (glibc)
 

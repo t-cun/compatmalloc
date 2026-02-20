@@ -1,8 +1,9 @@
 [target.x86_64-unknown-linux-gnu]
-# Use clang-21 as linker driver with lld-21 backend for fast linking.
-# Cross-language LTO is release-only: set RUSTFLAGS="-Clinker-plugin-lto"
-# for release/bench builds (CI workflows do this automatically).
-# Applying -Clinker-plugin-lto globally breaks debug/test builds because
-# mixed bitcode (Rust) + native ELF (C shim) causes TLS SIGSEGV.
-linker = "clang-21"
-rustflags = ["-Clink-arg=-fuse-ld=lld-21"]
+# Cross-language LTO (optional): set these env vars when clang-21 + lld-21
+# are installed to enable cross-boundary inlining of the C TLS shim:
+#
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang-21
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-Clinker-plugin-lto -Clink-arg=-fuse-ld=lld-21"
+#
+# The LLVM version must match rustc's bundled LLVM exactly.
+# Check with: rustc -vV | grep LLVM

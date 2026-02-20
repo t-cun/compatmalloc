@@ -31,12 +31,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   build-debug:
@@ -48,12 +42,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo build --workspace
       - name: Verify cdylib exists
         run: test -f target/debug/libcompatmalloc.so
@@ -67,15 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo build --workspace --release
-        env:
-          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto"
       - name: Verify cdylib exists
         run: test -f target/release/libcompatmalloc.so
       - name: Upload release artifact
@@ -95,12 +75,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo test --workspace
       - run: cargo test --workspace --release
 
@@ -114,12 +88,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo test --workspace --no-default-features
 
   test-individual-features:
@@ -143,10 +111,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('crates/**') }}
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
       - run: cargo test --workspace --no-default-features --features ${{ matrix.feature }}

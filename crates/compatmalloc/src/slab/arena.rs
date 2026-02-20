@@ -601,6 +601,8 @@ impl Arena {
     /// Writes directly to per-slab inline metadata -- NO lock needed.
     /// Returns the right-aligned user pointer.
     /// `align` controls the gap alignment (MIN_ALIGN for regular malloc, requested alignment for memalign).
+    /// `is_realloc`: when true, skip clearing stale canary bytes (the realloc caller
+    /// copies data first and clears the newly exposed region itself).
     ///
     /// # Safety
     /// `slab_raw` must point to a valid Slab, `slot_base_ptr` must be the slot's base address.
@@ -612,6 +614,7 @@ impl Arena {
         size: usize,
         class_idx: usize,
         align: usize,
+        is_realloc: bool,
     ) -> *mut u8 {
         let slab = &*(slab_raw as *mut Slab);
         let meta = slab.get_slot_meta_ref(slot_index as usize);
@@ -623,20 +626,15 @@ impl Arena {
         // gap is zero, user_ptr == slot_base. Skip alignment/gap computation.
         let aligned_size = align_up(size, crate::util::MIN_ALIGN);
         if aligned_size >= slot_sz {
-            // When canaries are enabled, clear stale canary bytes that may
-            // persist from a previous smaller allocation in this slot.
-            // During in-place realloc (same size class, growing), the old
-            // canary at [old_req, slot_sz) partially overlaps the new user
-            // region [0, size). Zero only the affected range [old_req, size).
+            // Clear the user-visible region of recycled slots to remove stale
+            // canary bytes from a previous allocation. Canary writes below will
+            // fill [size, slot_sz); this zeros [0, size).
+            // Skipped for realloc: the caller copies data first, then clears.
             #[cfg(feature = "canaries")]
-            {
-                let old_req = meta.requested_size.get() as usize;
-                if old_req > 0 && old_req < size && old_req < slot_sz {
-                    let clear_start = slot_base_ptr.add(old_req);
-                    let clear_len = size - old_req;
-                    core::ptr::write_bytes(clear_start, 0, clear_len);
-                }
+            if !is_realloc {
+                core::ptr::write_bytes(slot_base_ptr, 0, size.min(slot_sz));
             }
+
             meta.requested_size_store(size as u32);
             meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
             let checksum = crate::hardening::integrity::compute_checksum(
@@ -646,9 +644,12 @@ impl Arena {
             );
             meta.checksum_store(checksum);
             // Still need back-gap canary when requested_size < slot_size
-            // (e.g., malloc(49) with slot_size=64: gap=0 but 15 bytes of back canary)
+            // (e.g., malloc(49) with slot_size=64: gap=0 but 15 bytes of back canary).
+            // Skipped for realloc: canary must be written AFTER the caller copies data,
+            // otherwise the copy may read canary bytes from the source region when the
+            // user pointer shifts within the slot.
             #[cfg(feature = "canaries")]
-            if size < slot_sz {
+            if !is_realloc && size < slot_sz {
                 crate::hardening::canary::write_canary(slot_base_ptr, size, slot_sz, checksum);
             }
             return slot_base_ptr;
@@ -658,11 +659,11 @@ impl Arena {
         let gap = crate::util::align_down(slot_sz - aligned_size, align);
         let user_ptr = slot_base_ptr.add(gap);
 
-        // NOTE: we intentionally do NOT zero the entire slot here.
-        // The canary writes below overwrite the gap regions, and the user
-        // region is either uninitialized (fresh alloc) or preserved by the
-        // caller (realloc copies data after this function returns).
-        // Zeroing the full slot would destroy user data during in-place realloc.
+        // Clear the user-visible region (same rationale as fast path).
+        #[cfg(feature = "canaries")]
+        if !is_realloc {
+            core::ptr::write_bytes(user_ptr, 0, size);
+        }
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -671,9 +672,10 @@ impl Arena {
             crate::hardening::integrity::compute_checksum(slot_base_ptr as usize, size as u32, 0);
         meta.checksum_store(checksum);
 
-        // Write canary bytes in the gap regions
+        // Write canary bytes in the gap regions.
+        // Skipped for realloc: canary must be written AFTER the caller copies data.
         #[cfg(feature = "canaries")]
-        {
+        if !is_realloc {
             if gap > 0 {
                 crate::hardening::canary::write_canary_front(slot_base_ptr, gap, checksum);
             }

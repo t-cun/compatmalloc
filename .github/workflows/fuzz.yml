@@ -43,13 +43,6 @@ jobs:
         with:
           key: ${{ hashFiles('crates/**', 'fuzz/**') }}
 
-      - name: Install clang-21 and lld-21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
-
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 

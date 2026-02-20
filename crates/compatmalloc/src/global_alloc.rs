@@ -95,7 +95,10 @@ unsafe impl GlobalAlloc for CompatMalloc {
         }
 
         // Rust's GlobalAlloc contract guarantees new_size > 0.
-        debug_assert!(new_size > 0, "GlobalAlloc::realloc called with new_size == 0");
+        debug_assert!(
+            new_size > 0,
+            "GlobalAlloc::realloc called with new_size == 0"
+        );
 
         // ensure_initialized() is not needed here: if we have a valid ptr
         // from a prior allocation, the allocator is already initialized.

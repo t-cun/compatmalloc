@@ -136,6 +136,7 @@ pub unsafe fn write_canary_front(slot_base: *mut u8, gap: usize, canary: u64) {
     if gap == 0 {
         return;
     }
+
     let mut i = 0;
     while i + 8 <= gap {
         (slot_base.add(i) as *mut u64).write_unaligned(canary);

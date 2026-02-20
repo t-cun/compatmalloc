@@ -124,6 +124,7 @@ impl HardenedAllocator {
                                 alloc_size,
                                 class_idx,
                                 MIN_ALIGN,
+                                false,
                             );
                         }
                     }
@@ -170,6 +171,7 @@ impl HardenedAllocator {
                     size,
                     class_idx,
                     MIN_ALIGN,
+                    false,
                 ));
             }
         }
@@ -190,6 +192,7 @@ impl HardenedAllocator {
                     size,
                     class_idx,
                     MIN_ALIGN,
+                    false,
                 ));
             }
         }
@@ -224,6 +227,7 @@ impl HardenedAllocator {
                     size,
                     class_idx,
                     MIN_ALIGN,
+                    false,
                 ));
             }
         }
@@ -255,6 +259,7 @@ impl HardenedAllocator {
             size,
             class_idx,
             MIN_ALIGN,
+            false,
         );
 
         for item in buf.iter().take(n).skip(1) {
@@ -288,6 +293,7 @@ impl HardenedAllocator {
                             size,
                             class_idx,
                             align,
+                            false,
                         );
                         return Some(user_ptr);
                     }
@@ -315,6 +321,7 @@ impl HardenedAllocator {
                             size,
                             class_idx,
                             align,
+                            false,
                         );
                         return Some(user_ptr);
                     }
@@ -338,6 +345,7 @@ impl HardenedAllocator {
                             size,
                             class_idx,
                             align,
+                            false,
                         );
                         return Some(user_ptr);
                     }
@@ -370,6 +378,7 @@ impl HardenedAllocator {
                     size,
                     class_idx,
                     align,
+                    false,
                 );
 
                 for item in buf.iter().take(n).skip(1) {
@@ -804,6 +813,7 @@ impl HardenedAllocator {
                                             new_size,
                                             old_class,
                                             MIN_ALIGN,
+                                            true,
                                         );
                                     if new_user_ptr != ptr {
                                         let copy_size = old_size.min(new_size);
@@ -820,6 +830,37 @@ impl HardenedAllocator {
                                             new_size - old_size,
                                         );
                                     }
+
+                                    // Write canaries AFTER the copy (and growing clear).
+                                    // setup_cached_alloc_metadata defers canary writes for
+                                    // realloc because the copy may read from the canary region
+                                    // when the user pointer shifts within the slot.
+                                    #[cfg(feature = "canaries")]
+                                    {
+                                        let slot_sz = crate::slab::size_class::slot_size(old_class);
+                                        let front_gap = new_user_ptr as usize - slot_base as usize;
+                                        let checksum =
+                                            crate::hardening::integrity::compute_checksum(
+                                                slot_base as usize,
+                                                new_size as u32,
+                                                0,
+                                            );
+                                        if front_gap > 0 {
+                                            crate::hardening::canary::write_canary_front(
+                                                slot_base, front_gap, checksum,
+                                            );
+                                        }
+                                        let effective_slot_sz = slot_sz - front_gap;
+                                        if new_size < effective_slot_sz {
+                                            crate::hardening::canary::write_canary(
+                                                new_user_ptr,
+                                                new_size,
+                                                effective_slot_sz,
+                                                checksum,
+                                            );
+                                        }
+                                    }
+
                                     return new_user_ptr;
                                 }
                             }

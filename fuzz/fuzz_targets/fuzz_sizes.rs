@@ -2,10 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
-/// Fuzz target that exercises size boundaries and alignment.
-/// Interprets input as a series of (size, alignment_shift) pairs,
-/// allocates memory of that size, writes to the full extent,
-/// verifies alignment, and frees.
+// Fuzz target that exercises size boundaries and alignment.
+// Interprets input as a series of (size, alignment_shift) pairs,
+// allocates memory of that size, writes to the full extent,
+// verifies alignment, and frees.
 
 fuzz_target!(|data: &[u8]| {
     let mut i = 0;

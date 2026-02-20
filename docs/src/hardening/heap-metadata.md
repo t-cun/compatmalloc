@@ -11,7 +11,7 @@ The metadata table (`hardening::metadata::MetadataTable`) is a hash table backed
 ```rust
 pub struct AllocationMeta {
     pub requested_size: usize,  // The size the caller asked for
-    pub canary_value: u64,      // Expected canary for overflow detection
+    pub checksum_value: u64,    // Integrity checksum for corruption detection
     pub flags: u8,              // State flags (e.g., FLAG_FREED)
 }
 ```
@@ -56,7 +56,7 @@ Every call to `free` looks up the pointer in the metadata table to:
 
 1. Check the `FLAG_FREED` bit for double-free detection.
 2. Retrieve the `requested_size` for canary checking and poison filling.
-3. Retrieve the `canary_value` for canary validation.
+3. Retrieve the `checksum_value` for integrity validation.
 
 This adds a hash table lookup to every free operation, but the table is kept small relative to the number of live allocations, and the multiplicative hash provides good cache behavior.
 
