@@ -18,6 +18,7 @@ pub struct QuarantineEntry {
 }
 
 impl QuarantineEntry {
+    #[allow(dead_code)]
     pub const fn empty() -> Self {
         QuarantineEntry {
             ptr: core::ptr::null_mut(),

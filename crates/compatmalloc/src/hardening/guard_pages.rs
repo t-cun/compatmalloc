@@ -4,12 +4,14 @@
 use crate::util::page_size;
 
 /// Check if guard pages are enabled.
+#[allow(dead_code)]
 #[inline]
 pub fn guard_pages_enabled() -> bool {
     cfg!(feature = "guard-pages")
 }
 
 /// Size overhead per slab region from guard pages (before + after).
+#[allow(dead_code)]
 #[inline]
 pub fn slab_guard_overhead() -> usize {
     if cfg!(feature = "guard-pages") {
@@ -20,6 +22,7 @@ pub fn slab_guard_overhead() -> usize {
 }
 
 /// Size overhead per large allocation from guard pages.
+#[allow(dead_code)]
 #[inline]
 pub fn large_guard_overhead() -> usize {
     if cfg!(feature = "guard-pages") {

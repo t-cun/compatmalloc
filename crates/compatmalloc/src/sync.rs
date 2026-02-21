@@ -92,6 +92,7 @@ impl RawMutex {
     }
 
     /// Try to lock without blocking. Returns true if lock was acquired.
+    #[allow(dead_code)]
     #[inline]
     pub fn try_lock(&self) -> bool {
         self.state
@@ -101,6 +102,7 @@ impl RawMutex {
 }
 
 /// A mutex that wraps data, similar to std::sync::Mutex but allocation-free.
+#[allow(dead_code)]
 pub struct Mutex<T> {
     raw: RawMutex,
     data: UnsafeCell<T>,
@@ -109,6 +111,7 @@ pub struct Mutex<T> {
 unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
+#[allow(dead_code)]
 impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
@@ -131,6 +134,7 @@ impl<T> Mutex<T> {
     }
 }
 
+#[allow(dead_code)]
 pub struct MutexGuard<'a, T> {
     mutex: &'a Mutex<T>,
 }

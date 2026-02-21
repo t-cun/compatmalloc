@@ -144,6 +144,7 @@ impl MetadataTable {
 
     /// # Safety
     /// `ptr` must be a valid allocation pointer.
+    #[allow(dead_code)]
     pub unsafe fn get_and_mark_freed(&self, ptr: *mut u8) -> Option<AllocationMeta> {
         self.lock.lock();
         let inner = &*self.inner.get();

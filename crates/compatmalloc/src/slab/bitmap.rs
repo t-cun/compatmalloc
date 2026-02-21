@@ -51,18 +51,21 @@ impl SlabBitmap {
     }
 
     /// Number of free slots.
+    #[allow(dead_code)]
     #[inline]
     pub fn free_count(&self) -> usize {
         self.free_count
     }
 
     /// Total number of slots.
+    #[allow(dead_code)]
     #[inline]
     pub fn num_slots(&self) -> usize {
         self.num_slots
     }
 
     /// Allocate the first free slot. Returns the slot index, or None if full.
+    #[allow(dead_code)]
     pub fn alloc_first_free(&mut self) -> Option<usize> {
         for i in 0..self.num_words {
             let word = unsafe { self.words.add(i).read() };

@@ -10,9 +10,9 @@
 use std::ptr;
 
 /// Helper: initialize the allocator and return a reference to it.
-unsafe fn alloc() -> &'static compatmalloc::allocator::HardenedAllocator {
-    compatmalloc::init::ensure_initialized();
-    compatmalloc::init::allocator()
+unsafe fn alloc() -> &'static compatmalloc::__test_support::HardenedAllocator {
+    compatmalloc::__test_support::ensure_initialized();
+    compatmalloc::__test_support::allocator()
 }
 
 // ---------------------------------------------------------------------------
@@ -396,13 +396,14 @@ fn large_alloc_reuse_does_not_leak_data() {
         assert!(!q.is_null());
 
         // After MADV_DONTNEED, the kernel returns zero-filled pages.
-        // No byte should contain the old pattern.
+        // Verify the entire region is zero, not just free of the 0xAB pattern.
         let slice = core::slice::from_raw_parts(q, size);
-        let leaked_bytes = slice.iter().filter(|&&b| b == 0xAB).count();
+        let non_zero = slice.iter().filter(|&&b| b != 0).count();
         assert_eq!(
-            leaked_bytes, 0,
-            "large allocation reuse leaked {} bytes of previous data",
-            leaked_bytes
+            non_zero, 0,
+            "large allocation reuse: expected all-zero pages after MADV_DONTNEED, \
+             found {} non-zero bytes",
+            non_zero
         );
 
         a.free(q);

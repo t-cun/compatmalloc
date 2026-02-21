@@ -33,6 +33,7 @@ pub struct PageInfo {
 }
 
 impl PageInfo {
+    #[allow(dead_code)]
     pub const fn empty() -> Self {
         PageInfo {
             slab_ptr: ptr::null_mut(),
@@ -41,6 +42,7 @@ impl PageInfo {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.slab_ptr.is_null()

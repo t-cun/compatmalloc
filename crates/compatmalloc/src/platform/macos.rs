@@ -33,7 +33,22 @@ pub unsafe fn protect_read_write(ptr: *mut u8, size: usize) {
 }
 
 pub unsafe fn advise_free(ptr: *mut u8, size: usize) {
-    libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_FREE);
+    // On macOS, MADV_DONTNEED is advisory-only and does NOT guarantee
+    // zero-filled pages on reuse. Use mmap(MAP_FIXED) to atomically replace
+    // the mapping with fresh zero-filled anonymous pages, matching the
+    // zero-fill guarantee that Linux MADV_DONTNEED provides.
+    let ret = libc::mmap(
+        ptr as *mut libc::c_void,
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+        -1,
+        0,
+    );
+    debug_assert!(
+        ret != libc::MAP_FAILED,
+        "mmap(MAP_FIXED) failed in advise_free"
+    );
 }
 
 pub fn num_cpus() -> usize {

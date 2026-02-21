@@ -38,6 +38,7 @@ pub unsafe fn unmap(ptr: *mut u8, size: usize) {
 ///
 /// # Safety
 /// `ptr` and `size` must refer to a valid mapped region and be page-aligned.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn protect_none(ptr: *mut u8, size: usize) {
     sys::protect_none(ptr, size);
@@ -47,6 +48,7 @@ pub unsafe fn protect_none(ptr: *mut u8, size: usize) {
 ///
 /// # Safety
 /// `ptr` and `size` must refer to a valid mapped region and be page-aligned.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn protect_read_write(ptr: *mut u8, size: usize) {
     sys::protect_read_write(ptr, size);
@@ -75,6 +77,7 @@ pub fn thread_id() -> usize {
 
 /// Get a fast, non-cryptographic random u64.
 /// Uses thread-local xorshift64* state to avoid global atomic contention.
+#[allow(dead_code)]
 pub fn fast_random_u64() -> u64 {
     use core::cell::Cell;
 

@@ -287,6 +287,7 @@ impl ThreadState {
     }
 
     /// Get a fast random u64 using xorshift64*.
+    #[allow(dead_code)]
     #[inline]
     fn fast_random(&mut self) -> u64 {
         let mut s = self.rng;
@@ -498,6 +499,7 @@ pub fn thread_id() -> usize {
 }
 
 /// Get fast random from consolidated state, or fallback to platform.
+#[allow(dead_code)]
 #[inline]
 pub fn fast_random_u64() -> u64 {
     match with_thread_state(|state| state.fast_random()) {

@@ -32,6 +32,7 @@ pub unsafe fn unmap(ptr: *mut u8, size: usize) {
 ///
 /// # Safety
 /// Region must be valid and page-aligned.
+#[allow(dead_code)]
 pub unsafe fn protect_none(ptr: *mut u8, size: usize) {
     libc::mprotect(ptr as *mut libc::c_void, size, libc::PROT_NONE);
 }
@@ -40,6 +41,7 @@ pub unsafe fn protect_none(ptr: *mut u8, size: usize) {
 ///
 /// # Safety
 /// Region must be valid and page-aligned.
+#[allow(dead_code)]
 pub unsafe fn protect_read_write(ptr: *mut u8, size: usize) {
     libc::mprotect(
         ptr as *mut libc::c_void,
@@ -49,11 +51,13 @@ pub unsafe fn protect_read_write(ptr: *mut u8, size: usize) {
 }
 
 /// Advise kernel that pages can be reclaimed.
+/// On Linux, MADV_DONTNEED guarantees zero-filled pages on next access.
 ///
 /// # Safety
 /// Region must be valid and page-aligned.
 pub unsafe fn advise_free(ptr: *mut u8, size: usize) {
-    libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_DONTNEED);
+    let ret = libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_DONTNEED);
+    debug_assert!(ret == 0, "madvise(MADV_DONTNEED) failed");
 }
 
 /// Get the number of online CPUs.

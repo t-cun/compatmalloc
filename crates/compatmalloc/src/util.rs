@@ -15,6 +15,7 @@ pub const fn align_down(value: usize, align: usize) -> usize {
 }
 
 /// Check if `value` is aligned to `align`.
+#[allow(dead_code)]
 #[inline(always)]
 pub const fn is_aligned(value: usize, align: usize) -> bool {
     value & (align - 1) == 0
@@ -65,10 +66,12 @@ pub const LARGE_THRESHOLD: usize = 16384; // 16 KiB
 pub const MAX_ARENAS: usize = 32;
 
 /// Default quarantine size in bytes.
+#[allow(dead_code)]
 pub const DEFAULT_QUARANTINE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Largest power of 2 that divides `x`. Returns x's lowest set bit.
 /// E.g., 128 -> 128, 96 -> 32, 48 -> 16.
+#[allow(dead_code)]
 #[inline(always)]
 pub const fn largest_pow2_dividing(x: usize) -> usize {
     if x == 0 {
@@ -78,7 +81,9 @@ pub const fn largest_pow2_dividing(x: usize) -> usize {
 }
 
 /// Poison byte written to freed memory.
+#[allow(dead_code)]
 pub const POISON_BYTE: u8 = 0xFE;
 
 /// Byte used for junk-filling new allocations (debug).
+#[allow(dead_code)]
 pub const JUNK_BYTE: u8 = 0xCD;

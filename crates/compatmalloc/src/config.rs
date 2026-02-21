@@ -1,9 +1,9 @@
-use crate::util::DEFAULT_QUARANTINE_BYTES;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Cached config values (read once at init, never allocate).
 static ARENA_COUNT: AtomicUsize = AtomicUsize::new(0);
-static QUARANTINE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_QUARANTINE_BYTES);
+#[cfg(feature = "quarantine")]
+static QUARANTINE_BYTES: AtomicUsize = AtomicUsize::new(crate::util::DEFAULT_QUARANTINE_BYTES);
 
 /// Read configuration from environment variables.
 /// Must be called during init, before any allocations.
@@ -14,6 +14,7 @@ pub unsafe fn read_config() {
     if let Some(val) = getenv_usize(b"COMPATMALLOC_ARENA_COUNT\0") {
         ARENA_COUNT.store(val, Ordering::Relaxed);
     }
+    #[cfg(feature = "quarantine")]
     if let Some(val) = getenv_usize(b"COMPATMALLOC_QUARANTINE_SIZE\0") {
         QUARANTINE_BYTES.store(val, Ordering::Relaxed);
     }
@@ -31,6 +32,7 @@ pub fn arena_count() -> usize {
     ARENA_COUNT.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "quarantine")]
 pub fn quarantine_bytes() -> usize {
     QUARANTINE_BYTES.load(Ordering::Relaxed)
 }

@@ -5,6 +5,7 @@
 //! on every memory access. This replaces software canaries at zero cost.
 //!
 //! On non-MTE hardware, all operations are no-ops and `is_available()` returns false.
+#![allow(dead_code)]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

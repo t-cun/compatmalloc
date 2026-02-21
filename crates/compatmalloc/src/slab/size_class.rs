@@ -161,6 +161,7 @@ pub fn slots_per_slab(class_index: usize) -> usize {
 }
 
 /// Total memory needed for a slab of a given class (just the slot data, no metadata).
+#[allow(dead_code)]
 pub fn slab_data_size(class_index: usize) -> usize {
     slots_per_slab(class_index) * slot_size(class_index)
 }

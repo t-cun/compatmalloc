@@ -118,4 +118,5 @@ pub fn state() -> u8 {
 }
 
 pub const STATE_READY: u8 = READY;
+#[allow(dead_code)]
 pub const STATE_DISABLED: u8 = DISABLED;

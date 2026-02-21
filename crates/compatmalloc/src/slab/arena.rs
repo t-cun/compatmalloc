@@ -28,6 +28,7 @@ pub struct SlotMeta {
 const SLOT_META_FLAG_FREED: u8 = 0x01;
 
 impl SlotMeta {
+    #[allow(dead_code)]
     pub const fn empty() -> Self {
         SlotMeta {
             requested_size: Cell::new(0),
@@ -579,6 +580,7 @@ impl Arena {
     ///
     /// # Safety
     /// All slots in `slots` must be valid previously-allocated slots.
+    #[allow(dead_code)]
     pub unsafe fn free_batch_raw(
         &self,
         slots: &[crate::allocator::thread_cache::CachedSlot],
@@ -693,6 +695,7 @@ impl Arena {
     ///
     /// # Safety
     /// `slab_raw` must point to a valid Slab, `ptr` must be within its data region.
+    #[allow(dead_code)]
     pub unsafe fn free_direct(&self, slab_raw: *mut u8, ptr: *mut u8) -> bool {
         self.lock.lock();
         let inner = &mut *self.inner.get();
@@ -732,6 +735,7 @@ impl Arena {
     ///
     /// # Safety
     /// All slots in `slots` must be valid previously-allocated slots with checks done.
+    #[allow(dead_code)]
     pub unsafe fn free_batch_deferred(
         &self,
         slots: &[crate::allocator::thread_cache::CachedSlot],

@@ -20,31 +20,26 @@
 //! LD_PRELOAD=libcompatmalloc.so ./your_program
 //! ```
 
-extern crate libc;
-
 // Internal modules — not part of the public API.
-// allow(dead_code) on modules with scaffolded items for future platform
-// support (MTE, Windows) and API surface (batch free, generic Mutex).
 pub(crate) mod api;
 pub(crate) mod config;
 pub(crate) mod large;
-#[allow(dead_code)]
 pub(crate) mod platform;
-#[allow(dead_code)]
 pub(crate) mod slab;
-#[allow(dead_code)]
 pub(crate) mod sync;
-#[allow(dead_code)]
 pub(crate) mod util;
 
-// These modules are pub for integration test access but hidden from docs.
-// They are NOT part of the stability guarantee and may change without notice.
+pub(crate) mod allocator;
+pub(crate) mod hardening;
+pub(crate) mod init;
+
+/// Test-support re-exports. Hidden from docs.
+/// NOT part of the public API; may change without notice.
 #[doc(hidden)]
-pub mod allocator;
-#[doc(hidden)]
-pub mod hardening;
-#[doc(hidden)]
-pub mod init;
+pub mod __test_support {
+    pub use crate::allocator::HardenedAllocator;
+    pub use crate::init::{allocator, ensure_initialized};
+}
 
 #[cfg(feature = "global-allocator")]
 mod global_alloc;

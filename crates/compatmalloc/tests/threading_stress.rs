@@ -9,9 +9,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 /// Helper: initialize the allocator and return a reference to it.
-unsafe fn alloc() -> &'static compatmalloc::allocator::HardenedAllocator {
-    compatmalloc::init::ensure_initialized();
-    compatmalloc::init::allocator()
+unsafe fn alloc() -> &'static compatmalloc::__test_support::HardenedAllocator {
+    compatmalloc::__test_support::ensure_initialized();
+    compatmalloc::__test_support::allocator()
 }
 
 // ---------------------------------------------------------------------------

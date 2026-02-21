@@ -58,6 +58,7 @@ pub unsafe fn init_canary_secret() {
 /// Unlike single splitmix64(addr ^ secret), this cannot be inverted even if the
 /// attacker knows the canary and the address, because splitmix64 destroys the
 /// algebraic structure needed to solve for the secret.
+#[allow(dead_code)]
 #[inline]
 pub fn generate_canary(ptr: *mut u8) -> u64 {
     let addr = ptr as u64;
@@ -70,6 +71,7 @@ pub fn generate_canary(ptr: *mut u8) -> u64 {
 /// # Safety
 /// `ptr` must point to a valid allocation of at least `slot_size` bytes.
 /// `requested_size <= slot_size`.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn write_canary(ptr: *mut u8, requested_size: usize, slot_size: usize, canary: u64) {
     let gap = slot_size - requested_size;
@@ -96,6 +98,7 @@ pub unsafe fn write_canary(ptr: *mut u8, requested_size: usize, slot_size: usize
 ///
 /// # Safety
 /// Same requirements as `write_canary`.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn check_canary(
     ptr: *mut u8,
@@ -131,6 +134,7 @@ pub unsafe fn check_canary(
 /// # Safety
 /// `slot_base` must point to a valid slot region. `gap` bytes from slot_base
 /// are the front canary region.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn write_canary_front(slot_base: *mut u8, gap: usize, canary: u64) {
     if gap == 0 {
@@ -153,6 +157,7 @@ pub unsafe fn write_canary_front(slot_base: *mut u8, gap: usize, canary: u64) {
 ///
 /// # Safety
 /// `slot_base` must point to a valid slot region with at least `gap` readable bytes.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn check_canary_front(slot_base: *mut u8, gap: usize, canary: u64) -> bool {
     if gap == 0 {

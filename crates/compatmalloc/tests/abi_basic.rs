@@ -12,9 +12,9 @@ use std::ptr;
 /// Must be called before any allocator operations.  The returned reference
 /// is `'static` and backed by a global; it is safe to use from a single
 /// test at a time (Rust's default test runner serializes `#[test]` functions).
-unsafe fn alloc() -> &'static compatmalloc::allocator::HardenedAllocator {
-    compatmalloc::init::ensure_initialized();
-    compatmalloc::init::allocator()
+unsafe fn alloc() -> &'static compatmalloc::__test_support::HardenedAllocator {
+    compatmalloc::__test_support::ensure_initialized();
+    compatmalloc::__test_support::allocator()
 }
 
 // ---------------------------------------------------------------------------

@@ -40,7 +40,9 @@ impl LargeEntry {
 }
 
 /// A cached VMA mapping available for reuse.
-/// Guard pages remain PROT_NONE; data pages have been MADV_DONTNEED'd.
+///
+/// Invariant: data pages have been MADV_DONTNEED'd (zeroed by kernel on next access).
+/// Guard pages (when enabled) remain PROT_NONE throughout the cache lifetime.
 #[derive(Clone, Copy)]
 struct CachedMapping {
     base: *mut u8,
@@ -325,6 +327,11 @@ impl LargeAllocator {
     /// Push a mapping into the cache. If full, evicts the smallest cached
     /// mapping (munmaps it) to make room, keeping larger mappings cached
     /// since they're more expensive to recreate.
+    ///
+    /// Note: `advise_free()` is a syscall executed under the large allocator
+    /// lock. This adds latency to the critical section but is necessary for
+    /// correctness — moving it outside the lock would create a window where
+    /// another thread could `pop_cached` and receive non-zeroed pages.
     unsafe fn push_cached(inner: &mut LargeInner, mapping: CachedMapping) {
         // Release physical pages to prevent information leaks on reuse.
         #[cfg(feature = "guard-pages")]
