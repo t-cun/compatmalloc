@@ -214,8 +214,7 @@ impl HardenedAllocator {
 
         let remaining = s.cache.recycle_frees(class_idx, 32);
         if remaining > 0 {
-            let arena_idx = s.arena_index(self.num_arenas);
-            self.drain_and_flush(&mut s.cache, class_idx, arena_idx);
+            self.drain_and_flush(&mut s.cache, class_idx);
         }
 
         if let Some(cached) = s.cache.pop(class_idx) {
@@ -332,7 +331,7 @@ impl HardenedAllocator {
 
                 // Verified flush: do deferred security checks then arena processing
                 if remaining > 0 {
-                    self.drain_and_flush(cache, class_idx, arena_idx);
+                    self.drain_and_flush(cache, class_idx);
                 }
 
                 // Try again after recycle
@@ -483,7 +482,7 @@ impl HardenedAllocator {
                 _pad: 0,
                 cached_size,
             };
-            self.free_evict_fast_reg(s, cached, class_idx_u8, arena_idx);
+            self.free_evict_fast_reg(s, cached, class_idx_u8);
         }
 
         true
@@ -544,12 +543,11 @@ impl HardenedAllocator {
         s: &mut thread_cache::ThreadState,
         new_cached: thread_cache::CachedSlot,
         new_class: u8,
-        arena_idx: usize,
     ) {
         let old_class = s.fast_reg_class as usize;
         s.cache.push_free(old_class, s.fast_reg);
         if s.cache.free_is_full(old_class) {
-            self.drain_and_flush(&mut s.cache, old_class, arena_idx);
+            self.drain_and_flush(&mut s.cache, old_class);
         }
         s.fast_reg = new_cached;
         s.fast_reg_class = new_class;
@@ -565,23 +563,23 @@ impl HardenedAllocator {
         &self,
         cache: &mut thread_cache::ThreadCache,
         class_index: usize,
-        arena_idx: usize,
     ) {
         let (buf, count) = cache.drain_frees_ref(class_index);
         if count > 0 {
-            self.flush_free_buffer_verified(buf, count, arena_idx);
+            self.flush_free_buffer_verified(buf, count);
         }
     }
 
     /// Verify deferred security checks for a batch of freed slots, then
-    /// hand them to the arena for quarantine/bitmap processing.
+    /// hand them to the correct arena for quarantine/bitmap processing.
+    /// Each entry is dispatched to its own arena (entries may belong to
+    /// different arenas due to cross-thread frees).
     /// Runs at batch boundaries (~every 64 frees), amortizing the cost.
     #[inline(never)]
     unsafe fn flush_free_buffer_verified(
         &self,
         buf: &[crate::allocator::thread_cache::CachedSlot],
         count: usize,
-        arena_idx: usize,
     ) {
         for cached in buf.iter().take(count) {
             if cached.slab_ptr.is_null() {
@@ -648,10 +646,17 @@ impl HardenedAllocator {
             {
                 core::ptr::write_bytes(slot_base, 0, slot_sz);
             }
-        }
 
-        // Hand to arena for quarantine/bitmap processing (takes lock)
-        self.arenas[arena_idx].free_batch_deferred(buf, count);
+            // Dispatch to the entry's own arena for quarantine/bitmap processing
+            let entry_arena = cached.arena_index as usize;
+            if entry_arena < self.num_arenas {
+                self.arenas[entry_arena].free_direct_prechecked(
+                    cached.slab_ptr,
+                    cached.ptr,
+                    slot_idx,
+                );
+            }
+        }
     }
 
     /// Eager fallback: verify + poison + free directly when TLS is unavailable.

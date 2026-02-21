@@ -71,7 +71,7 @@ impl SlotMeta {
         }
         self.flags.store(
             old | SLOT_META_FLAG_FREED,
-            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Release,
         );
         true
     }
@@ -616,6 +616,7 @@ impl Arena {
         align: usize,
         is_realloc: bool,
     ) -> *mut u8 {
+        let _ = is_realloc;
         let slab = &*(slab_raw as *mut Slab);
         let meta = slab.get_slot_meta_ref(slot_index as usize);
 
