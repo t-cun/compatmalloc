@@ -139,19 +139,14 @@ fi
 
 printf "\n${BOLD}=== Git ===${RESET}\n"
 
-if command -v git &>/dev/null; then
-    # Find a git repo to test with (use our own project)
-    run_test "git: log in project repo" \
-        git -C "$PROJECT_ROOT" log --oneline -5
+run_test "git: log in project repo" \
+    git -C "$PROJECT_ROOT" log --oneline -5
 
-    run_test "git: status in project repo" \
-        git -C "$PROJECT_ROOT" status --short
+run_test "git: status in project repo" \
+    git -C "$PROJECT_ROOT" status --short
 
-    run_test "git: branch list" \
-        git -C "$PROJECT_ROOT" branch --list
-else
-    skip "git: not installed"
-fi
+run_test "git: branch list" \
+    git -C "$PROJECT_ROOT" branch --list
 
 printf "\n${BOLD}=== Coreutils ===${RESET}\n"
 

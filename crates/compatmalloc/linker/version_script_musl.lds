@@ -1,0 +1,13 @@
+{
+    global:
+        malloc;
+        free;
+        realloc;
+        calloc;
+        posix_memalign;
+        aligned_alloc;
+        malloc_usable_size;
+        mallopt;
+    local:
+        *;
+};

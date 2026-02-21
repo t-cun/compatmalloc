@@ -1,0 +1,21 @@
+# Stage 1: Build compatmalloc from source on Alpine/musl
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache musl-dev clang lld
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+
+RUN RUSTFLAGS="-Clink-arg=-fuse-ld=lld -Ctarget-feature=-crt-static" \
+    cargo build --workspace --release && \
+    strip target/release/libcompatmalloc.so
+
+# Stage 2: Minimal output — just the .so file
+FROM scratch AS artifact
+COPY --from=builder /build/target/release/libcompatmalloc.so /libcompatmalloc.so
+
+# Stage 3: Harden any Alpine-based application
+FROM alpine:3.21 AS hardened-base
+COPY --from=builder /build/target/release/libcompatmalloc.so /usr/lib/libcompatmalloc.so
+ENV LD_PRELOAD=/usr/lib/libcompatmalloc.so

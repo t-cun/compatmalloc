@@ -196,6 +196,7 @@ pub unsafe extern "C" fn mallopt(_param: libc::c_int, _value: libc::c_int) -> li
 ///
 /// # Safety
 /// No special requirements; returns a zeroed struct.
+#[cfg(not(target_env = "musl"))]
 #[no_mangle]
 pub unsafe extern "C" fn mallinfo() -> libc::mallinfo {
     core::mem::zeroed()
@@ -205,7 +206,7 @@ pub unsafe extern "C" fn mallinfo() -> libc::mallinfo {
 ///
 /// # Safety
 /// No special requirements; returns a zeroed struct.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[no_mangle]
 pub unsafe extern "C" fn mallinfo2() -> libc::mallinfo2 {
     core::mem::zeroed()

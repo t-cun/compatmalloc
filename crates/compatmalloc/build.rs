@@ -9,12 +9,19 @@ fn main() {
             // script for cdylib targets, and anonymous + named tags conflict.
             let is_fuzzing = std::env::var("CARGO_CFG_FUZZING").is_ok();
             if !is_fuzzing {
-                let script = format!("{}/linker/version_script.lds", manifest_dir);
+                let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+                let script_name = if target_env == "musl" {
+                    "version_script_musl.lds"
+                } else {
+                    "version_script.lds"
+                };
+                let script = format!("{}/linker/{}", manifest_dir, script_name);
                 println!(
                     "cargo:rustc-cdylib-link-arg=-Wl,--version-script={}",
                     script
                 );
                 println!("cargo:rerun-if-changed=linker/version_script.lds");
+                println!("cargo:rerun-if-changed=linker/version_script_musl.lds");
             }
 
             // Compile C shim for fast TLS access (initial-exec model).

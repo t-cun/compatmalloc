@@ -78,3 +78,55 @@ jobs:
         run: |
           chmod +x tests/integration/test_preload.sh
           tests/integration/test_preload.sh
+
+  preload-validation-alpine:
+    name: LD_PRELOAD integration tests (Alpine/musl)
+    runs-on: ubuntu-latest
+    container:
+      image: rust:alpine
+    steps:
+      - name: Install git for checkout
+        run: apk add --no-cache git
+
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install build deps
+        run: apk add --no-cache musl-dev clang lld bash python3 findutils coreutils
+
+      - name: Build release library
+        run: RUSTFLAGS="-Clink-arg=-fuse-ld=lld -Ctarget-feature=-crt-static" cargo build --release
+      - name: Verify library exists
+        run: test -f target/release/libcompatmalloc.so
+
+      - name: Test with sh
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            sh -c 'echo hello; ls -la /tmp'
+
+      - name: Test with python3
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            python3 -c 'import json; print(json.dumps({"test": True}))'
+
+      - name: Test with ls
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            ls -la /
+
+      - name: Test with cat
+        run: |
+          LD_PRELOAD=./target/release/libcompatmalloc.so \
+            cat /etc/hostname
+
+      - name: Test disabled mode
+        run: |
+          COMPATMALLOC_DISABLE=1 LD_PRELOAD=./target/release/libcompatmalloc.so \
+            sh -c 'echo "Disabled mode works"; ls /tmp > /dev/null'
+
+      - name: Run full integration test script
+        run: |
+          chmod +x tests/integration/test_preload.sh
+          tests/integration/test_preload.sh

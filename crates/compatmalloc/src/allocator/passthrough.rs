@@ -60,6 +60,26 @@ pub unsafe fn resolve_real_functions() {
     }
 }
 
+/// Lazily resolve a single libc function via dlsym(RTLD_NEXT).
+/// Called on the cold path when eager init didn't populate the pointer
+/// (e.g. musl where RTLD_NEXT may not resolve during .init_array).
+///
+/// Uses compare_exchange so concurrent callers converge on the same pointer.
+/// Returns the resolved address, or 0 if dlsym returned NULL.
+#[cold]
+#[inline(never)]
+unsafe fn lazy_resolve(slot: &AtomicUsize, name: &core::ffi::CStr) -> usize {
+    let rtld_next = -1isize as *mut c_void; // RTLD_NEXT
+    let ptr = libc::dlsym(rtld_next, name.as_ptr());
+    if ptr.is_null() {
+        return 0;
+    }
+    let val = ptr as usize;
+    // CAS: if another thread resolved first, use their value.
+    let _ = slot.compare_exchange(0, val, Ordering::Release, Ordering::Acquire);
+    slot.load(Ordering::Acquire)
+}
+
 /// Bootstrap malloc using mmap -- used before dlsym resolves the real malloc.
 /// dlsym itself may call malloc, so we need a fallback that doesn't depend on libc malloc.
 static BOOTSTRAP_BUF_USED: AtomicUsize = AtomicUsize::new(0);
@@ -133,7 +153,10 @@ unsafe fn is_bootstrap_ptr(ptr: *mut u8) -> bool {
 /// Caller must ensure `size` is valid.
 #[inline]
 pub unsafe fn malloc(size: usize) -> *mut u8 {
-    let f = REAL_MALLOC.load(Ordering::Acquire);
+    let mut f = REAL_MALLOC.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_MALLOC, c"malloc");
+    }
     if f != 0 {
         let func: MallocFn = core::mem::transmute(f);
         func(size) as *mut u8
@@ -149,7 +172,10 @@ pub unsafe fn free(ptr: *mut u8) {
     if ptr.is_null() || is_bootstrap_ptr(ptr) {
         return;
     }
-    let f = REAL_FREE.load(Ordering::Acquire);
+    let mut f = REAL_FREE.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_FREE, c"free");
+    }
     if f != 0 {
         let func: FreeFn = core::mem::transmute(f);
         func(ptr as *mut c_void);
@@ -177,7 +203,10 @@ pub unsafe fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
         }
         return new;
     }
-    let f = REAL_REALLOC.load(Ordering::Acquire);
+    let mut f = REAL_REALLOC.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_REALLOC, c"realloc");
+    }
     if f != 0 {
         let func: ReallocFn = core::mem::transmute(f);
         func(ptr as *mut c_void, size) as *mut u8
@@ -190,7 +219,10 @@ pub unsafe fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
 /// Caller must ensure `nmemb` and `size` are valid.
 #[inline]
 pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut u8 {
-    let f = REAL_CALLOC.load(Ordering::Acquire);
+    let mut f = REAL_CALLOC.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_CALLOC, c"calloc");
+    }
     if f != 0 {
         let func: CallocFn = core::mem::transmute(f);
         func(nmemb, size) as *mut u8
@@ -212,7 +244,10 @@ pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut u8 {
 /// `alignment` must be a power of two.
 #[inline]
 pub unsafe fn memalign(alignment: usize, size: usize) -> *mut u8 {
-    let f = REAL_POSIX_MEMALIGN.load(Ordering::Acquire);
+    let mut f = REAL_POSIX_MEMALIGN.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_POSIX_MEMALIGN, c"posix_memalign");
+    }
     if f != 0 {
         let func: PosixMemalignFn = core::mem::transmute(f);
         let mut out: *mut c_void = ptr::null_mut();
@@ -232,7 +267,10 @@ pub unsafe fn memalign(alignment: usize, size: usize) -> *mut u8 {
 /// `ptr` must be a valid allocation pointer.
 #[inline]
 pub unsafe fn malloc_usable_size(ptr: *mut u8) -> usize {
-    let f = REAL_MALLOC_USABLE_SIZE.load(Ordering::Acquire);
+    let mut f = REAL_MALLOC_USABLE_SIZE.load(Ordering::Acquire);
+    if f == 0 {
+        f = lazy_resolve(&REAL_MALLOC_USABLE_SIZE, c"malloc_usable_size");
+    }
     if f != 0 {
         let func: MallocUsableSizeFn = core::mem::transmute(f);
         func(ptr as *mut c_void)

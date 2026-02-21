@@ -46,7 +46,6 @@ If `LD_PRELOAD` appears to have no effect:
 - **Use an absolute path.** `LD_PRELOAD` requires a full path or a library name findable via `ld.so`. Relative paths like `./target/...` work from the repo root but not elsewhere.
 - **setuid/setgid binaries ignore `LD_PRELOAD`.** This is a kernel security policy. Use `/etc/ld.so.preload` for system-wide coverage instead.
 - **Verify it loaded.** Run `LD_DEBUG=libs LD_PRELOAD=./target/release/libcompatmalloc.so ls 2>&1 | grep compatmalloc` -- you should see it being loaded.
-- **musl-based distros (Alpine).** compatmalloc targets glibc. musl's `LD_PRELOAD` behavior differs and is not currently supported.
 
 ## Performance
 
@@ -149,6 +148,25 @@ echo "/usr/lib/libcompatmalloc.so" | sudo tee -a /etc/ld.so.preload
 
 See the [PKGBUILD](pkg/arch/PKGBUILD) for packaging details.
 
+### Alpine / musl
+
+compatmalloc supports musl-based systems (Alpine Linux) via both LD_PRELOAD and `#[global_allocator]`.
+
+**LD_PRELOAD (container hardening):**
+
+```bash
+docker build -f Dockerfile.alpine --target hardened-base -t myapp-hardened .
+```
+
+**Rust native (`#[global_allocator]`):**
+
+```bash
+cargo add compatmalloc --features global-allocator
+cargo build --target x86_64-unknown-linux-musl
+```
+
+See the [Dockerfile.alpine](Dockerfile.alpine) for packaging details.
+
 ### Rust Native (`#[global_allocator]`)
 
 For Rust projects, skip `LD_PRELOAD` entirely. Add to `Cargo.toml`:
@@ -218,6 +236,7 @@ cargo build --release --no-default-features --features quarantine,canaries
 - [x] Docker integration
 - [x] Arch Linux PKGBUILD
 - [x] Native Rust `#[global_allocator]` support
+- [x] Alpine / musl support (LD_PRELOAD + `#[global_allocator]`)
 - [ ] Publish to crates.io
 - [ ] Yocto/OpenEmbedded recipe for IoT devices
 - [ ] Android (Bionic libc) compatibility
