@@ -371,3 +371,40 @@ fn metadata_records_requested_size() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: large allocation reuse does not leak previous data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn large_alloc_reuse_does_not_leak_data() {
+    unsafe {
+        let a = alloc();
+        // Allocate above LARGE_THRESHOLD (16384 bytes)
+        let size = 32768;
+        let p = a.malloc(size);
+        assert!(!p.is_null());
+
+        // Fill with a recognizable pattern
+        core::ptr::write_bytes(p, 0xAB, size);
+
+        // Free it (goes into the mapping cache)
+        a.free(p);
+
+        // Allocate the same size again (should hit the mapping cache)
+        let q = a.malloc(size);
+        assert!(!q.is_null());
+
+        // After MADV_DONTNEED, the kernel returns zero-filled pages.
+        // No byte should contain the old pattern.
+        let slice = core::slice::from_raw_parts(q, size);
+        let leaked_bytes = slice.iter().filter(|&&b| b == 0xAB).count();
+        assert_eq!(
+            leaked_bytes, 0,
+            "large allocation reuse leaked {} bytes of previous data",
+            leaked_bytes
+        );
+
+        a.free(q);
+    }
+}

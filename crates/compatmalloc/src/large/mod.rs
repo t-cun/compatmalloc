@@ -233,10 +233,9 @@ impl LargeAllocator {
                 // Remove entry from hash table
                 Self::remove_at(inner, idx);
 
-                // Cache the mapping for reuse. No MADV_DONTNEED here — the VMA
-                // keeps its physical pages for fast reuse (matching glibc behavior).
-                // Physical pages are only released on eviction or when the cache
-                // is cleaned up. Guard pages remain PROT_NONE throughout.
+                // Cache the mapping for reuse. Data pages are MADV_DONTNEED'd
+                // in push_cached to prevent information leaks. Guard pages
+                // remain PROT_NONE throughout.
                 Self::push_cached(
                     inner,
                     CachedMapping {
@@ -327,6 +326,13 @@ impl LargeAllocator {
     /// mapping (munmaps it) to make room, keeping larger mappings cached
     /// since they're more expensive to recreate.
     unsafe fn push_cached(inner: &mut LargeInner, mapping: CachedMapping) {
+        // Release physical pages to prevent information leaks on reuse.
+        #[cfg(feature = "guard-pages")]
+        let data_start = mapping.base.add(page_size());
+        #[cfg(not(feature = "guard-pages"))]
+        let data_start = mapping.base;
+        crate::platform::advise_free(data_start, mapping.data_size);
+
         if inner.mapping_cache_count < MAPPING_CACHE_SIZE {
             inner.mapping_cache[inner.mapping_cache_count] = mapping;
             inner.mapping_cache_count += 1;
