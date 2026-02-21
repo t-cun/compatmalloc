@@ -643,12 +643,17 @@ jobs:
             cat bench-arm64/bench-arm64-results.md >> docs/src/generated/benchmark-results.md
           fi
 
+      - name: Update README benchmarks
+        run: |
+          chmod +x benches/scripts/update_readme_benchmarks.sh
+          ./benches/scripts/update_readme_benchmarks.sh bench-x86
+
       - name: Commit benchmark results to docs
         if: github.ref == 'refs/heads/main'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/src/generated/benchmark-results.md
+          git add docs/src/generated/benchmark-results.md README.md
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else

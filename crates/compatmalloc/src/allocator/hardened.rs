@@ -559,11 +559,7 @@ impl HardenedAllocator {
     /// the hot path's stack frame from ~64 bytes to ~1560 bytes).
     #[cold]
     #[inline(never)]
-    unsafe fn drain_and_flush(
-        &self,
-        cache: &mut thread_cache::ThreadCache,
-        class_index: usize,
-    ) {
+    unsafe fn drain_and_flush(&self, cache: &mut thread_cache::ThreadCache, class_index: usize) {
         let (buf, count) = cache.drain_frees_ref(class_index);
         if count > 0 {
             self.flush_free_buffer_verified(buf, count);
