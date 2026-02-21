@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/t-cun/compatmalloc/actions/workflows/ci.yml/badge.svg)](https://github.com/t-cun/compatmalloc/actions/workflows/ci.yml)
 [![Benchmarks](https://github.com/t-cun/compatmalloc/actions/workflows/bench.yml/badge.svg)](https://github.com/t-cun/compatmalloc/actions/workflows/bench.yml)
+[![crates.io](https://img.shields.io/crates/v/compatmalloc.svg)](https://crates.io/crates/compatmalloc)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
 glibc's allocator prioritizes throughput over safety. Heap vulnerabilities -- use-after-free, buffer overflows, double frees, metadata corruption -- remain the most exploited bug classes in native software.
