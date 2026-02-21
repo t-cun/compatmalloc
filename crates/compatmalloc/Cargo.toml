@@ -3,7 +3,12 @@ name = "compatmalloc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "A memory-hardening drop-in allocator with standard C ABI"
+readme = "../../README.md"
+keywords = ["allocator", "malloc", "hardening", "security", "memory-safety"]
+categories = ["memory-management", "os"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
