@@ -56,11 +56,11 @@ compatmalloc delivers **hardened-allocator security at near-glibc throughput** -
 
 | Allocator | Latency (64B) | vs glibc | Throughput (1T) | vs glibc | Throughput (4T) | vs glibc |
 |-----------|------------:|--------:|--------------:|--------:|--------------:|--------:|
-| **compatmalloc** | 15.0 ns | 1.30x | 66.40 Mops/s | 0.84x | 148.63 Mops/s | 0.88x |
-| glibc | 11.5 ns | 1.00x | 78.95 Mops/s | 1.00x | 168.15 Mops/s | 1.00x |
-| jemalloc | 8.5 ns | 0.74x | 100.75 Mops/s | 1.28x | 251.32 Mops/s | 1.49x |
-| mimalloc | 11.3 ns | 0.98x | 80.49 Mops/s | 1.02x | 191.51 Mops/s | 1.14x |
-| scudo | 49.2 ns | 4.28x | 19.87 Mops/s | 0.25x | 40.21 Mops/s | 0.24x |
+| **compatmalloc** | 15.2 ns | 1.32x | 66.33 Mops/s | 0.85x | 152.11 Mops/s | 0.91x |
+| glibc | 11.5 ns | 1.00x | 78.30 Mops/s | 1.00x | 167.72 Mops/s | 1.00x |
+| jemalloc | 8.8 ns | 0.77x | 102.29 Mops/s | 1.31x | 243.33 Mops/s | 1.45x |
+| mimalloc | 11.3 ns | 0.98x | 80.35 Mops/s | 1.03x | 190.64 Mops/s | 1.14x |
+| scudo | 49.5 ns | 4.30x | 19.74 Mops/s | 0.25x | 39.71 Mops/s | 0.24x |
 
 > Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
 > **Hardened allocators:** compatmalloc, scudo. Both have security features (guard pages, quarantine, etc.) that add overhead vs pure-performance allocators.
@@ -71,11 +71,11 @@ compatmalloc delivers **hardened-allocator security at near-glibc throughput** -
 
 | Application | glibc | compatmalloc | Overhead |
 |-------------|------:|-------------:|---------:|
-| python-json | 0.066s | 0.075s | +14% |
-| redis | 2.468s | 2.440s | **-2%** |
-| nginx | 5.004s | 5.104s | +1% |
-| sqlite | 0.159s | 0.131s | **-18%** |
-| git | 0.165s | 0.188s | +13% |
+| python-json | 0.069s | 0.079s | +14% |
+| redis | 2.446s | 2.428s | **-1%** |
+| nginx | 5.104s | 5.104s | **-1%** |
+| sqlite | 0.166s | 0.132s | **-21%** |
+| git | 0.265s | 0.266s | **0%** |
 
 > Wall-clock time on shared GitHub Actions runners (no CPU pinning, no isolated cores). Results vary between runs due to noisy-neighbor effects, ASLR, and cache alignment. Negative overhead does not necessarily mean compatmalloc is faster -- it means the difference is within noise. These numbers show that overhead is low in practice, not that it is zero.
 
