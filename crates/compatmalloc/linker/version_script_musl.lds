@@ -8,6 +8,7 @@
         aligned_alloc;
         malloc_usable_size;
         mallopt;
+        compatmalloc_check_integrity;
     local:
         *;
 };

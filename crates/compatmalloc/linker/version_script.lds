@@ -13,6 +13,7 @@
         mallopt;
         mallinfo;
         mallinfo2;
+        compatmalloc_check_integrity;
     local:
         *;
 };
