@@ -24,6 +24,9 @@ echo ""
 RESULTS_FILE="$PROJECT_ROOT/bench-apps.txt"
 > "$RESULTS_FILE"
 
+# Track whether any LD_PRELOAD test crashed (= compatmalloc bug)
+PRELOAD_FAILURES=0
+
 # ---- Helpers ----------------------------------------------------------------
 
 # time_cmd: measure wall time of a command in seconds (nanosecond precision).
@@ -140,7 +143,8 @@ if command -v redis-server &>/dev/null && command -v redis-benchmark &>/dev/null
         compat_time=$(run_redis_bench "compatmalloc" env LD_PRELOAD="$LIB")
         if [ "$compat_time" = "FAIL" ]; then
             echo "  compatmalloc: FAILED (redis-server crashed with LD_PRELOAD)"
-            echo "  SKIPPED: redis benchmark (server incompatible with LD_PRELOAD)"
+            echo "  ERROR: redis crashed under LD_PRELOAD — this is a compatmalloc bug"
+            PRELOAD_FAILURES=$((PRELOAD_FAILURES + 1))
         else
             echo "  compatmalloc: ${compat_time}s"
             record "redis" "$glibc_time" "$compat_time"
@@ -231,7 +235,8 @@ NGINX_CONF
         compat_time=$(run_nginx_bench "compatmalloc" env LD_PRELOAD="$LIB")
         if [ "$compat_time" = "FAIL" ]; then
             echo "  compatmalloc: FAILED (nginx crashed with LD_PRELOAD)"
-            echo "  SKIPPED: nginx benchmark (server incompatible with LD_PRELOAD)"
+            echo "  ERROR: nginx crashed under LD_PRELOAD — this is a compatmalloc bug"
+            PRELOAD_FAILURES=$((PRELOAD_FAILURES + 1))
         else
             echo "  compatmalloc: ${compat_time}s"
             record "nginx" "$glibc_time" "$compat_time"
@@ -317,7 +322,8 @@ else
     compat_time=$(run_git_bench "compatmalloc" "$GIT_DIR/compat-clone" env LD_PRELOAD="$LIB")
     if [ "$compat_time" = "FAIL" ]; then
         echo "  compatmalloc: FAILED (git clone crashed with LD_PRELOAD)"
-        echo "  SKIPPED: git benchmark (git incompatible with LD_PRELOAD)"
+        echo "  ERROR: git crashed under LD_PRELOAD — this is a compatmalloc bug"
+        PRELOAD_FAILURES=$((PRELOAD_FAILURES + 1))
     else
         echo "  compatmalloc: ${compat_time}s"
         record "git" "$glibc_time" "$compat_time"
@@ -342,4 +348,11 @@ done < "$RESULTS_FILE"
 
 echo ""
 echo "Results written to: $RESULTS_FILE"
+
+if [ "$PRELOAD_FAILURES" -gt 0 ]; then
+    echo "ERROR: $PRELOAD_FAILURES application(s) crashed under LD_PRELOAD"
+    echo "This indicates a bug in compatmalloc. Failing the benchmark."
+    exit 1
+fi
+
 echo "=== Done ==="
