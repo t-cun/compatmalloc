@@ -230,6 +230,13 @@ pub(crate) struct ThreadState {
     /// Amortized fork generation check counter.
     /// 0 = time to check; decremented each operation. Saves ~5 cycles/op.
     pub(crate) fork_check_counter: u8,
+    /// Thread-local large allocation cache: single-entry cache to avoid
+    /// lock + MADV_DONTNEED syscall on tight large alloc/free loops.
+    /// Stores the most recently freed large allocation for same-thread reuse.
+    pub(crate) large_cache_base: *mut u8,
+    pub(crate) large_cache_total_size: usize,
+    pub(crate) large_cache_data_size: usize,
+    pub(crate) large_cache_user_ptr: *mut u8,
 }
 
 impl ThreadState {
@@ -246,6 +253,8 @@ impl ThreadState {
             self.arena_idx_valid = false;
             self.mru_valid = false;
             self.fast_reg.ptr = core::ptr::null_mut();
+            self.large_cache_base = core::ptr::null_mut();
+            self.large_cache_user_ptr = core::ptr::null_mut();
             self.generation = current_gen;
         }
     }
