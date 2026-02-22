@@ -657,6 +657,18 @@ impl HardenedAllocator {
         s.large_cache_user_ptr = core::ptr::null_mut();
     }
 
+    /// Flush the thread-local large cache during thread exit.
+    /// Called from `thread_state_destructor` before the ThreadState is unmapped.
+    ///
+    /// # Safety
+    /// `state` must be a valid pointer to the thread's ThreadState.
+    pub(crate) unsafe fn flush_large_cache_on_thread_exit(
+        &self,
+        state: &mut thread_cache::ThreadState,
+    ) {
+        self.evict_large_cache(state);
+    }
+
     /// Slow free path: handles large allocations, TLS-unavailable fallback,
     /// and arena scanning. Cold path — not inlined.
     #[cold]

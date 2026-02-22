@@ -404,10 +404,30 @@ pub unsafe fn init_tls() {
 }
 
 /// Destructor called when a thread exits. Frees the mmap'd ThreadState.
+///
+/// IMPORTANT: glibc's `__libc_thread_freeres` runs AFTER pthread key destructors
+/// and calls `free()` to clean up thread-local state (e.g., DNS resolver).
+/// We must null out the TLS slot before unmapping so those late `free()` calls
+/// see a null state pointer and fall through to the slow path.
 unsafe extern "C" fn thread_state_destructor(ptr: *mut libc::c_void) {
     if ptr.is_null() {
         return;
     }
+
+    // Clear the TLS slot BEFORE unmapping so any subsequent free() calls
+    // (from glibc's __libc_thread_freeres) see null and use the slow path
+    // instead of dereferencing the unmapped ThreadState.
+    tls_set_inline(core::ptr::null_mut());
+
+    // Flush the thread-local large allocation cache if present.
+    // Without this, the cached mapping (hash table entry, page map entry,
+    // and virtual memory) would leak when the thread exits.
+    let state = &mut *(ptr as *mut ThreadState);
+    if !state.large_cache_base.is_null() {
+        let alloc = crate::init::allocator();
+        alloc.flush_large_cache_on_thread_exit(state);
+    }
+
     let size = core::mem::size_of::<ThreadState>();
     let aligned_size = crate::util::align_up(size, crate::util::page_size());
     libc::munmap(ptr, aligned_size);
