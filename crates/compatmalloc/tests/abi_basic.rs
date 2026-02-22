@@ -411,3 +411,36 @@ fn rapid_malloc_free_single_thread() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Large alloc/free cycle (exercises thread-local large cache path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn large_alloc_free_cycle() {
+    // Verify large alloc/free works correctly in a tight loop
+    // (exercises thread-local cache path)
+    unsafe {
+        let a = alloc();
+        for _ in 0..1000 {
+            let p = a.malloc(65536);
+            assert!(!p.is_null());
+            ptr::write_bytes(p, 0xAB, 64);
+            a.free(p);
+        }
+    }
+}
+
+#[test]
+fn large_alloc_varying_sizes() {
+    // Verify cache eviction works when sizes vary
+    unsafe {
+        let a = alloc();
+        for &size in [65536usize, 131072, 65536, 262144, 65536].iter() {
+            let p = a.malloc(size);
+            assert!(!p.is_null());
+            ptr::write_bytes(p, 0xAB, 64);
+            a.free(p);
+        }
+    }
+}

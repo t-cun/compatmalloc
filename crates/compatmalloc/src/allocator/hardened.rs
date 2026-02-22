@@ -142,7 +142,17 @@ impl HardenedAllocator {
                 let arena = self.select_arena();
                 arena.alloc(alloc_size, class_idx)
             }
-            None => self.large.alloc(alloc_size, &self.large_metadata),
+            None => {
+                // Try thread-local large cache first
+                let state = thread_cache::get_thread_state_raw();
+                if !state.is_null() {
+                    let s = &mut *state;
+                    if let Some(ptr) = self.malloc_large_from_cache(s, alloc_size) {
+                        return ptr;
+                    }
+                }
+                self.large.alloc(alloc_size, &self.large_metadata)
+            }
         }
     }
 
@@ -387,6 +397,77 @@ impl HardenedAllocator {
             },
             self.num_arenas,
         )?
+    }
+
+    /// Try to allocate a large block from the thread-local cache.
+    /// Avoids the global lock for mmap, mprotect, and hash table insert on the hot path.
+    #[inline(always)]
+    unsafe fn malloc_large_from_cache(
+        &self,
+        s: &mut thread_cache::ThreadState,
+        size: usize,
+    ) -> Option<*mut u8> {
+        if s.large_cache_base.is_null() {
+            return None;
+        }
+
+        let data_size = crate::util::align_up(size, crate::util::page_size());
+
+        #[cfg(feature = "guard-pages")]
+        let needed_total = crate::util::page_size() + data_size + crate::util::page_size();
+        #[cfg(not(feature = "guard-pages"))]
+        let needed_total = data_size;
+
+        if s.large_cache_total_size < needed_total {
+            return None;
+        }
+
+        // Take the cached mapping
+        let base = s.large_cache_base;
+        let total_size = s.large_cache_total_size;
+        let cached_data_size = s.large_cache_data_size;
+        s.large_cache_base = core::ptr::null_mut();
+        s.large_cache_user_ptr = core::ptr::null_mut();
+
+        #[cfg(feature = "guard-pages")]
+        let user_ptr = base.add(crate::util::page_size());
+        #[cfg(not(feature = "guard-pages"))]
+        let user_ptr = base;
+
+        // Zero the data region for security (previous allocation's data may still be there).
+        // MADV_DONTNEED is cheaper than memset for large regions: kernel zeros pages lazily.
+        crate::platform::advise_free(user_ptr, cached_data_size);
+
+        // Register in the global large allocator table and page map
+        let entry = crate::large::LargeEntry {
+            key: user_ptr as usize,
+            base,
+            total_size,
+            data_size: cached_data_size,
+            requested_size: size,
+        };
+
+        self.large.lock_and_insert(entry);
+        page_map::register_large(user_ptr, cached_data_size);
+
+        // Set up metadata
+        #[cfg(feature = "canaries")]
+        {
+            let canary = crate::hardening::canary::generate_canary(user_ptr);
+            self.large_metadata.insert(
+                user_ptr,
+                crate::hardening::metadata::AllocationMeta::new(size, canary),
+            );
+        }
+        #[cfg(not(feature = "canaries"))]
+        {
+            self.large_metadata.insert(
+                user_ptr,
+                crate::hardening::metadata::AllocationMeta::new(size, 0),
+            );
+        }
+
+        Some(user_ptr)
     }
 
     /// Free memory.

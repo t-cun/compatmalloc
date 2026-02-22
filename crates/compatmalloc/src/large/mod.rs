@@ -18,13 +18,13 @@ const LARGE_TABLE_CAPACITY: usize = 4096;
 const MAPPING_CACHE_SIZE: usize = 16;
 
 #[derive(Clone, Copy)]
-struct LargeEntry {
+pub struct LargeEntry {
     /// Key: user_ptr as usize (0 = empty slot).
-    key: usize,
-    base: *mut u8,
-    total_size: usize,
-    data_size: usize,
-    requested_size: usize,
+    pub key: usize,
+    pub base: *mut u8,
+    pub total_size: usize,
+    pub data_size: usize,
+    pub requested_size: usize,
 }
 
 impl LargeEntry {
@@ -348,6 +348,16 @@ impl LargeAllocator {
             },
         );
         self.lock.unlock();
+    }
+
+    /// Insert a large allocation entry under lock.
+    /// Used by thread-local cache to re-register a reused mapping.
+    pub unsafe fn lock_and_insert(&self, entry: LargeEntry) -> bool {
+        self.lock.lock();
+        let inner = &mut *self.inner.get();
+        let result = Self::insert_entry(inner, entry);
+        self.lock.unlock();
+        result
     }
 
     // ========================================================================
