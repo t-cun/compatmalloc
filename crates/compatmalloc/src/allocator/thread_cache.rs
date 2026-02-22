@@ -237,6 +237,9 @@ pub(crate) struct ThreadState {
     pub(crate) large_cache_total_size: usize,
     pub(crate) large_cache_data_size: usize,
     pub(crate) large_cache_user_ptr: *mut u8,
+    /// Cached requested_size from the freed allocation; used to skip hash table
+    /// update on same-size reuse (avoids acquiring the global large lock).
+    pub(crate) large_cache_requested_size: usize,
 }
 
 impl ThreadState {

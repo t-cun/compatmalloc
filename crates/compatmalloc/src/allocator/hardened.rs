@@ -423,34 +423,19 @@ impl HardenedAllocator {
         }
 
         // Take the cached mapping
-        let base = s.large_cache_base;
-        let total_size = s.large_cache_total_size;
-        let cached_data_size = s.large_cache_data_size;
+        let user_ptr = s.large_cache_user_ptr;
+        let old_requested_size = s.large_cache_requested_size;
         s.large_cache_base = core::ptr::null_mut();
         s.large_cache_user_ptr = core::ptr::null_mut();
 
-        #[cfg(feature = "guard-pages")]
-        let user_ptr = base.add(crate::util::page_size());
-        #[cfg(not(feature = "guard-pages"))]
-        let user_ptr = base;
+        // Same-thread reuse: data belongs to this thread (no cross-thread leak).
+        // Zeroing is deferred to eviction (evict_to_global_cache does MADV_DONTNEED).
+        // calloc handles its own zeroing independently via memset.
 
-        // Zero the data region for security (previous allocation's data may still be there).
-        // MADV_DONTNEED is cheaper than memset for large regions: kernel zeros pages lazily.
-        crate::platform::advise_free(user_ptr, cached_data_size);
+        // NO page_map::register_large — entry was never unregistered.
+        // NO large.lock_and_insert — hash table entry was never removed.
 
-        // Register in the global large allocator table and page map
-        let entry = crate::large::LargeEntry {
-            key: user_ptr as usize,
-            base,
-            total_size,
-            data_size: cached_data_size,
-            requested_size: size,
-        };
-
-        self.large.lock_and_insert(entry);
-        page_map::register_large(user_ptr, cached_data_size);
-
-        // Set up metadata
+        // Update metadata: clear freed flag, update requested_size and canary.
         #[cfg(feature = "canaries")]
         {
             let canary = crate::hardening::canary::generate_canary(user_ptr);
@@ -465,6 +450,13 @@ impl HardenedAllocator {
                 user_ptr,
                 crate::hardening::metadata::AllocationMeta::new(size, 0),
             );
+        }
+
+        // Update hash table entry's requested_size only if it changed
+        // (for malloc_usable_size / realloc correctness). Same-size reuse
+        // (the common case in tight loops) skips the global lock entirely.
+        if size != old_requested_size {
+            self.large.lock_and_update_requested_size(user_ptr, size);
         }
 
         Some(user_ptr)
@@ -574,42 +566,95 @@ impl HardenedAllocator {
     }
 
     /// Try to cache a large allocation in the thread-local single-entry cache.
-    /// Skips MADV_DONTNEED and global lock on the hot path, saving ~1-2us per free.
-    /// Returns true if cached, false to fall through to global path.
+    /// On the hot path: metadata mark-freed + hash table read-only lookup only.
+    /// No MADV_DONTNEED, no hash table remove, no page map unregister.
+    /// These expensive operations are deferred to eviction (evict_large_cache).
     #[inline(always)]
     unsafe fn free_large_to_cache(&self, s: &mut thread_cache::ThreadState, ptr: *mut u8) -> bool {
-        // Check page map to verify this is a large allocation
+        // Check page map to verify this is a large allocation (lock-free)
         match page_map::lookup(ptr) {
             Some(info) if info.is_large() => {}
             _ => return false,
         }
 
-        // Remove from global table, getting mapping info
-        let (base, total_size, data_size) =
-            match self.large.lock_and_remove(ptr, &self.large_metadata) {
-                Some(i) => i,
-                None => return false,
-            };
-
-        // Unregister from page map
-        page_map::unregister_large(ptr, data_size);
-
-        // Evict any existing thread-local cached mapping to the global cache
-        if !s.large_cache_base.is_null() {
-            self.large.push_to_global_cache(
-                s.large_cache_base,
-                s.large_cache_total_size,
-                s.large_cache_data_size,
-            );
+        // Local double-free check: if this pointer is already in our TLS cache
+        // (freed but not yet reused), it's an immediate double free.
+        if s.large_cache_user_ptr == ptr && !s.large_cache_base.is_null() {
+            crate::hardening::abort_with_message("compatmalloc: double free detected (large)\n");
         }
 
-        // Store in thread-local cache
+        // Double-free check and mark freed in metadata (single metadata lock).
+        // Also captures requested_size to compute mapping dimensions locally,
+        // avoiding a separate hash table lookup (saves one lock acquisition).
+        let cached_requested_size;
+        if let Some(meta) = self.large_metadata.get_and_mark_freed(ptr) {
+            if meta.is_freed() {
+                crate::hardening::abort_with_message(
+                    "compatmalloc: double free detected (large)\n",
+                );
+            }
+            cached_requested_size = meta.requested_size;
+        } else {
+            return false;
+        }
+
+        // Compute mapping dimensions from requested_size and pointer.
+        // This avoids acquiring the large lock for a hash table lookup.
+        // For oversized mappings (reused from global cache), the computed
+        // data_size may be smaller than the actual mapping, causing some
+        // cache misses for different-size reuse. Same-size reuse (the
+        // common case) always computes correct values.
+        let data_size = crate::util::align_up(cached_requested_size, crate::util::page_size());
+
+        #[cfg(feature = "guard-pages")]
+        let base = ptr.sub(crate::util::page_size());
+        #[cfg(not(feature = "guard-pages"))]
+        let base = ptr;
+
+        #[cfg(feature = "guard-pages")]
+        let total_size = crate::util::page_size() + data_size + crate::util::page_size();
+        #[cfg(not(feature = "guard-pages"))]
+        let total_size = data_size;
+
+        // Evict old TLS cache entry if present (full cleanup: hash table remove,
+        // page map unregister, MADV_DONTNEED via global cache push).
+        if !s.large_cache_base.is_null() {
+            self.evict_large_cache(s);
+        }
+
+        // Store in thread-local cache. Hash table entry and page map
+        // registration are left in place (no remove, no unregister).
         s.large_cache_base = base;
         s.large_cache_total_size = total_size;
         s.large_cache_data_size = data_size;
         s.large_cache_user_ptr = ptr;
+        s.large_cache_requested_size = cached_requested_size;
 
         true
+    }
+
+    /// Evict the thread-local large cache entry: full cleanup.
+    /// Removes from hash table + page map, pushes mapping to global cache
+    /// (which does MADV_DONTNEED for security), and removes metadata.
+    #[cold]
+    #[inline(never)]
+    unsafe fn evict_large_cache(&self, s: &mut thread_cache::ThreadState) {
+        let old_ptr = s.large_cache_user_ptr;
+
+        // Remove metadata entry (lock order: metadata lock first)
+        self.large_metadata.remove(old_ptr);
+
+        // Look up actual mapping dimensions from hash table, remove entry,
+        // and push mapping to global cache (MADV_DONTNEED) — single large lock.
+        let actual_data_size = self.large.evict_to_global_cache(old_ptr);
+
+        // Unregister from page map using actual data_size (lock-free atomic stores)
+        if actual_data_size > 0 {
+            page_map::unregister_large(old_ptr, actual_data_size);
+        }
+
+        s.large_cache_base = core::ptr::null_mut();
+        s.large_cache_user_ptr = core::ptr::null_mut();
     }
 
     /// Slow free path: handles large allocations, TLS-unavailable fallback,

@@ -291,73 +291,60 @@ impl LargeAllocator {
         result
     }
 
-    /// Remove a large allocation entry and return its mapping info.
-    /// Used by thread-local cache to take ownership without MADV_DONTNEED.
-    pub unsafe fn lock_and_remove(
-        &self,
-        ptr: *mut u8,
-        metadata: &MetadataTable,
-    ) -> Option<(*mut u8, usize, usize)> {
-        // Check metadata BEFORE acquiring large lock (lock ordering: metadata -> large)
-        if let Some(meta) = metadata.get(ptr) {
-            if meta.is_freed() {
-                crate::hardening::abort_with_message(
-                    "compatmalloc: double free detected (large)\n",
-                );
-            }
-        }
-        metadata.remove(ptr);
-
+    /// Update only the requested_size field of an existing hash table entry.
+    /// Used when the thread-local cache reuses a mapping for a different size.
+    pub unsafe fn lock_and_update_requested_size(&self, ptr: *mut u8, requested_size: usize) {
         self.lock.lock();
         let inner = &mut *self.inner.get();
-
         let key = ptr as usize;
         let mask = LARGE_TABLE_CAPACITY - 1;
         let mut idx = hash_large_ptr(key) & mask;
-
         loop {
-            let entry = &inner.entries[idx];
-            if entry.key == key {
-                let base = entry.base;
-                let total_size = entry.total_size;
-                let data_size = entry.data_size;
-                Self::remove_at(inner, idx);
-                self.lock.unlock();
-                return Some((base, total_size, data_size));
+            if inner.entries[idx].key == key {
+                inner.entries[idx].requested_size = requested_size;
+                break;
             }
-            if entry.key == 0 {
+            if inner.entries[idx].key == 0 {
                 break;
             }
             idx = (idx + 1) & mask;
         }
         self.lock.unlock();
-        None
     }
 
-    /// Push a mapping into the global cache (with MADV_DONTNEED).
-    /// Called when the thread-local cache evicts its entry.
-    pub unsafe fn push_to_global_cache(&self, base: *mut u8, total_size: usize, data_size: usize) {
+    /// Eviction helper: look up entry by pointer, remove from hash table, and
+    /// push mapping to global cache (with MADV_DONTNEED), all in a single lock.
+    /// Returns the actual data_size for page map unregistration, or 0 if not found.
+    pub unsafe fn evict_to_global_cache(&self, user_ptr: *mut u8) -> usize {
         self.lock.lock();
         let inner = &mut *self.inner.get();
-        Self::push_cached(
-            inner,
-            CachedMapping {
-                base,
-                total_size,
-                data_size,
-            },
-        );
+        let key = user_ptr as usize;
+        let mask = LARGE_TABLE_CAPACITY - 1;
+        let mut idx = hash_large_ptr(key) & mask;
+        let mut actual_data_size = 0;
+        loop {
+            if inner.entries[idx].key == key {
+                let base = inner.entries[idx].base;
+                let total_size = inner.entries[idx].total_size;
+                actual_data_size = inner.entries[idx].data_size;
+                Self::remove_at(inner, idx);
+                Self::push_cached(
+                    inner,
+                    CachedMapping {
+                        base,
+                        total_size,
+                        data_size: actual_data_size,
+                    },
+                );
+                break;
+            }
+            if inner.entries[idx].key == 0 {
+                break;
+            }
+            idx = (idx + 1) & mask;
+        }
         self.lock.unlock();
-    }
-
-    /// Insert a large allocation entry under lock.
-    /// Used by thread-local cache to re-register a reused mapping.
-    pub unsafe fn lock_and_insert(&self, entry: LargeEntry) -> bool {
-        self.lock.lock();
-        let inner = &mut *self.inner.get();
-        let result = Self::insert_entry(inner, entry);
-        self.lock.unlock();
-        result
+        actual_data_size
     }
 
     // ========================================================================

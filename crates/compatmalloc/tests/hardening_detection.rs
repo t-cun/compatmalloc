@@ -377,7 +377,7 @@ fn metadata_records_requested_size() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn large_alloc_reuse_does_not_leak_data() {
+fn large_calloc_reuse_returns_zeroed_data() {
     unsafe {
         let a = alloc();
         // Allocate above LARGE_THRESHOLD (16384 bytes)
@@ -388,20 +388,55 @@ fn large_alloc_reuse_does_not_leak_data() {
         // Fill with a recognizable pattern
         core::ptr::write_bytes(p, 0xAB, size);
 
-        // Free it (goes into the mapping cache)
+        // Free it (goes into the thread-local cache)
         a.free(p);
 
-        // Allocate the same size again (should hit the mapping cache)
-        let q = a.malloc(size);
+        // calloc must return zeroed memory even when hitting the TLS cache.
+        // malloc may return same-thread stale data (no cross-thread leak),
+        // but calloc always zeroes.
+        let q = a.calloc(1, size);
         assert!(!q.is_null());
 
-        // After MADV_DONTNEED, the kernel returns zero-filled pages.
-        // Verify the entire region is zero, not just free of the 0xAB pattern.
         let slice = core::slice::from_raw_parts(q, size);
         let non_zero = slice.iter().filter(|&&b| b != 0).count();
         assert_eq!(
             non_zero, 0,
-            "large allocation reuse: expected all-zero pages after MADV_DONTNEED, \
+            "large calloc reuse: expected all-zero pages, found {} non-zero bytes",
+            non_zero
+        );
+
+        a.free(q);
+    }
+}
+
+#[test]
+fn large_alloc_cross_thread_does_not_leak_data() {
+    unsafe {
+        let a = alloc();
+        // Allocate and fill a large allocation
+        let size = 32768;
+        let p = a.malloc(size);
+        assert!(!p.is_null());
+        core::ptr::write_bytes(p, 0xAB, size);
+        a.free(p);
+
+        // Force the TLS cache entry through eviction (by allocating/freeing
+        // a different size, which evicts the old entry to the global cache
+        // where MADV_DONTNEED zeroes it).
+        let p2 = a.malloc(size * 2);
+        assert!(!p2.is_null());
+        a.free(p2);
+
+        // Now allocate the original size again — should come from the global
+        // cache (post-MADV_DONTNEED), not the TLS cache.
+        let q = a.malloc(size);
+        assert!(!q.is_null());
+
+        let slice = core::slice::from_raw_parts(q, size);
+        let non_zero = slice.iter().filter(|&&b| b != 0).count();
+        assert_eq!(
+            non_zero, 0,
+            "large cross-thread reuse: expected zero-filled pages after eviction, \
              found {} non-zero bytes",
             non_zero
         );
