@@ -686,7 +686,11 @@ impl HardenedAllocator {
                 let slab = &*(info.slab_ptr as *mut crate::slab::arena::Slab);
                 let slot_index = match slab.slot_for_ptr(ptr) {
                     Some(s) => s,
-                    None => return,
+                    None => {
+                        crate::hardening::abort_with_message(
+                            "compatmalloc: free() called on invalid pointer (not a slot boundary)\n",
+                        );
+                    }
                 };
                 let meta = slab.get_slot_meta_ref(slot_index);
                 if !meta.try_mark_freed() {
@@ -712,6 +716,10 @@ impl HardenedAllocator {
                 return;
             }
         }
+
+        crate::hardening::abort_with_message(
+            "compatmalloc: free() called on invalid pointer (unknown allocation)\n",
+        );
     }
 
     /// Cold path: evict the old fast register to the free buffer, storing the

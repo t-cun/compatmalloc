@@ -81,6 +81,8 @@ fn scenario_driver() {
     match scenario.as_str() {
         "double_free" => scenario_double_free(),
         "canary_corruption" => scenario_canary_corruption(),
+        "invalid_free_garbage" => scenario_invalid_free_garbage(),
+        "invalid_free_stack" => scenario_invalid_free_stack(),
         _ => panic!("unknown scenario: {}", scenario),
     }
 }
@@ -138,6 +140,26 @@ fn scenario_canary_corruption() {
     unreachable!("canary corruption was not detected");
 }
 
+/// Scenario: free a garbage pointer (0x1) that was never returned by malloc.
+#[allow(clippy::manual_dangling_ptr)]
+fn scenario_invalid_free_garbage() {
+    unsafe {
+        let a = alloc();
+        a.free(0x1 as *mut u8);
+    }
+    unreachable!("invalid free of garbage pointer was not detected");
+}
+
+/// Scenario: free a stack pointer (a real address, but not a heap allocation).
+fn scenario_invalid_free_stack() {
+    unsafe {
+        let a = alloc();
+        let mut stack_var: u64 = 0xDEAD;
+        a.free(&mut stack_var as *mut u64 as *mut u8);
+    }
+    unreachable!("invalid free of stack pointer was not detected");
+}
+
 // ---------------------------------------------------------------------------
 // Test: double-free is detected (subprocess)
 // ---------------------------------------------------------------------------
@@ -145,6 +167,24 @@ fn scenario_canary_corruption() {
 #[test]
 fn double_free_detected() {
     expect_abort_subprocess("double_free", "double free detected");
+}
+
+// ---------------------------------------------------------------------------
+// Test: free of garbage pointer is detected (subprocess)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn invalid_free_garbage_detected() {
+    expect_abort_subprocess("invalid_free_garbage", "free() called on invalid pointer");
+}
+
+// ---------------------------------------------------------------------------
+// Test: free of stack pointer is detected (subprocess)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn invalid_free_stack_detected() {
+    expect_abort_subprocess("invalid_free_stack", "free() called on invalid pointer");
 }
 
 // ---------------------------------------------------------------------------
