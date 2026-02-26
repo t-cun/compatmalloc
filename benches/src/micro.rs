@@ -108,7 +108,7 @@ fn main() {
     println!("=== microbenchmarks ({}) ===\n", name);
 
     // Machine-parseable key results for comparison
-    let mut key_latency_64 = 0.0f64;
+    let mut latencies: Vec<(usize, f64)> = Vec::new();
     let mut key_throughput_1t = 0.0f64;
     let mut key_throughput_4t = 0.0f64;
 
@@ -116,9 +116,7 @@ fn main() {
     for &size in &[16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144] {
         let ns = bench_malloc_free(size, iterations);
         println!("  size={:>8}: {:>8.1} ns", size, ns);
-        if size == 64 {
-            key_latency_64 = ns;
-        }
+        latencies.push((size, ns));
     }
 
     println!("\n--- calloc/free latency (ns/op) ---");
@@ -180,8 +178,12 @@ fn main() {
     }
 
     // Print machine-parseable summary line
-    println!("\nSUMMARY|{}|latency_64={:.1}|throughput_1t={:.2}|throughput_4t={:.2}",
-        name, key_latency_64, key_throughput_1t, key_throughput_4t);
+    print!("\nSUMMARY|{}", name);
+    for &(size, ns) in &latencies {
+        print!("|latency_{}={:.1}", size, ns);
+    }
+    println!("|throughput_1t={:.2}|throughput_4t={:.2}",
+        key_throughput_1t, key_throughput_4t);
 
     println!("\nDone.");
 }
