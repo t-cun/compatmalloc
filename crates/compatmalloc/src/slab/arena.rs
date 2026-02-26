@@ -416,10 +416,12 @@ impl Arena {
 
     /// # Safety
     /// Caller must ensure the arena has been initialized.
-    pub unsafe fn alloc(&self, size: usize, class_index: usize) -> *mut u8 {
+    /// `align` controls the front-gap alignment (MIN_ALIGN for malloc,
+    /// requested alignment for memalign).
+    pub unsafe fn alloc(&self, size: usize, class_index: usize, align: usize) -> *mut u8 {
         self.lock.lock();
         let inner = &mut *self.inner.get();
-        let result = Self::alloc_inner(inner, size, class_index, self.arena_index);
+        let result = Self::alloc_inner(inner, size, class_index, self.arena_index, align);
         self.lock.unlock();
         result
     }
@@ -429,6 +431,7 @@ impl Arena {
         size: usize,
         class_index: usize,
         arena_index: usize,
+        align: usize,
     ) -> *mut u8 {
         let list = &mut inner.slab_lists[class_index];
 
@@ -436,7 +439,7 @@ impl Arena {
         let mut slab_ptr = list.head;
         while !slab_ptr.is_null() {
             let slab = &mut *slab_ptr;
-            if let Some(ptr) = Self::try_alloc_from_slab(slab, size) {
+            if let Some(ptr) = Self::try_alloc_from_slab(slab, size, align) {
                 return ptr;
             }
             slab_ptr = slab.next;
@@ -452,10 +455,10 @@ impl Arena {
         (*new_slab).next = list.head;
         list.head = new_slab;
 
-        Self::try_alloc_from_slab(&mut *new_slab, size).unwrap_or(ptr::null_mut())
+        Self::try_alloc_from_slab(&mut *new_slab, size, align).unwrap_or(ptr::null_mut())
     }
 
-    unsafe fn try_alloc_from_slab(slab: &mut Slab, size: usize) -> Option<*mut u8> {
+    unsafe fn try_alloc_from_slab(slab: &mut Slab, size: usize, align: usize) -> Option<*mut u8> {
         #[cfg(feature = "slot-randomization")]
         let slot = slab
             .bitmap
@@ -464,15 +467,14 @@ impl Arena {
         let slot = slab.bitmap.alloc_first_free()?;
 
         // Right-aligned: user pointer is at end of slot
-        let user_ptr = slab.slot_user_ptr(slot, size, crate::util::MIN_ALIGN);
+        let user_ptr = slab.slot_user_ptr(slot, size, align);
 
         // Write metadata directly to per-slab array (no hash, no lock)
         let meta = slab.get_slot_meta(slot);
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
-        meta.align_shift
-            .set(crate::util::MIN_ALIGN.trailing_zeros() as u8);
+        meta.align_shift.set(align.trailing_zeros() as u8);
 
         let slot_base = slab.slot_base(slot);
 

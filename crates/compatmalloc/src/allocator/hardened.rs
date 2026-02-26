@@ -140,7 +140,7 @@ impl HardenedAllocator {
                     }
                 }
                 let arena = self.select_arena();
-                arena.alloc(alloc_size, class_idx)
+                arena.alloc(alloc_size, class_idx, MIN_ALIGN)
             }
             None => {
                 // Try thread-local large cache first
@@ -1209,7 +1209,7 @@ impl HardenedAllocator {
                 return ptr;
             }
             let arena = self.select_arena();
-            return arena.alloc(alloc_size, class_idx);
+            return arena.alloc(alloc_size, class_idx, alignment);
         }
 
         // No suitable slab class: use large allocator (page-aligned via mmap).
