@@ -142,7 +142,8 @@ jobs:
               lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
               t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
               t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
-              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
+              all_latencies=$(echo "$best_summary" | grep -o 'latency_[0-9]*=[0-9.]*' | tr '\n' '|')
+              echo "BEST|${NAME}|${all_latencies}throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
           else
               echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0|rss_kb=0" > "bench-${NAME}-best.txt"
           fi
@@ -224,6 +225,28 @@ jobs:
             fi
           }
 
+          # Weighted composite overhead: real-world allocation size distribution
+          compute_composite() {
+            local alloc_file="$1" baseline_file="$2"
+            local sizes="16 32 64 128 256 512 1024 4096 16384 65536 262144"
+            local weights="0.20 0.15 0.15 0.12 0.10 0.08 0.05 0.05 0.04 0.03 0.03"
+            local composite=0
+            local i=1
+            for size in $sizes; do
+              local w=$(echo "$weights" | cut -d' ' -f$i)
+              local a_lat=$(parse_best "$alloc_file" "latency_${size}")
+              local g_lat=$(parse_best "$baseline_file" "latency_${size}")
+              if [ -n "$a_lat" ] && [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
+                local ratio=$(echo "scale=4; $a_lat / $g_lat" | bc -l 2>/dev/null || echo "1")
+                composite=$(echo "scale=4; $composite + $w * $ratio" | bc -l)
+              else
+                composite=$(echo "scale=4; $composite + $w" | bc -l)
+              fi
+              i=$((i + 1))
+            done
+            echo "scale=1; ($composite - 1) * 100" | bc -l 2>/dev/null || echo "?"
+          }
+
           # Collect all allocator names from bench-*-best.txt files
           allocators=()
           for f in bench-*-best.txt; do
@@ -245,12 +268,7 @@ jobs:
             t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
             rss=$(parse_best "bench-${name}-best.txt" "rss_kb")
 
-            # Compute ratios vs glibc
-            if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
-              lat_ratio=$(echo "scale=2; $lat / $g_lat" | bc 2>/dev/null || echo "?")
-            else
-              lat_ratio="?"
-            fi
+            # Compute throughput ratios vs glibc
             if [ -n "$g_t1" ] && [ "$g_t1" != "0" ] && [ "$g_t1" != "0.0" ]; then
               t1_ratio=$(echo "scale=2; $t1 / $g_t1" | bc 2>/dev/null || echo "?")
             else
@@ -262,7 +280,20 @@ jobs:
               t4_ratio="?"
             fi
 
-            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
+            composite=$(compute_composite "bench-${name}-best.txt" "bench-glibc-best.txt")
+            if [ "$composite" != "?" ]; then
+              if [ "$(echo "$composite > 0" | bc 2>/dev/null)" = "1" ]; then
+                composite_display="+${composite}%"
+              elif [ "$(echo "$composite == 0" | bc 2>/dev/null)" = "1" ]; then
+                composite_display="0%"
+              else
+                composite_display="${composite}%"
+              fi
+            else
+              composite_display="—"
+            fi
+
+            table_rows="${table_rows}| **${name}** | ${composite_display} | ${lat} ns | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
           "
           done
 
@@ -289,8 +320,8 @@ jobs:
 
           ### Multi-Allocator Comparison
 
-          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
-          |-----------|------------:|------:|--------------:|------:|--------------:|------:|---------:|
+          | Allocator | Weighted Overhead | Latency (64B) | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
+          |-----------|------------------:|------------:|--------------:|------:|--------------:|------:|---------:|
           ${table_rows}
 
           > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
@@ -452,7 +483,8 @@ jobs:
               lat=$(echo "$best_summary" | sed 's/.*latency_64=\([0-9.]*\).*/\1/')
               t1=$(echo "$best_summary" | sed 's/.*throughput_1t=\([0-9.]*\).*/\1/')
               t4=$(echo "$best_summary" | sed 's/.*throughput_4t=\([0-9.]*\).*/\1/')
-              echo "BEST|${NAME}|latency_64=${lat}|throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
+              all_latencies=$(echo "$best_summary" | grep -o 'latency_[0-9]*=[0-9.]*' | tr '\n' '|')
+              echo "BEST|${NAME}|${all_latencies}throughput_1t=${t1}|throughput_4t=${t4}|rss_kb=${rss_kb}" > "bench-${NAME}-best.txt"
           else
               echo "BEST|${NAME}|latency_64=0|throughput_1t=0|throughput_4t=0|rss_kb=0" > "bench-${NAME}-best.txt"
           fi
@@ -508,6 +540,28 @@ jobs:
             fi
           }
 
+          # Weighted composite overhead: real-world allocation size distribution
+          compute_composite() {
+            local alloc_file="$1" baseline_file="$2"
+            local sizes="16 32 64 128 256 512 1024 4096 16384 65536 262144"
+            local weights="0.20 0.15 0.15 0.12 0.10 0.08 0.05 0.05 0.04 0.03 0.03"
+            local composite=0
+            local i=1
+            for size in $sizes; do
+              local w=$(echo "$weights" | cut -d' ' -f$i)
+              local a_lat=$(parse_best "$alloc_file" "latency_${size}")
+              local g_lat=$(parse_best "$baseline_file" "latency_${size}")
+              if [ -n "$a_lat" ] && [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
+                local ratio=$(echo "scale=4; $a_lat / $g_lat" | bc -l 2>/dev/null || echo "1")
+                composite=$(echo "scale=4; $composite + $w * $ratio" | bc -l)
+              else
+                composite=$(echo "scale=4; $composite + $w" | bc -l)
+              fi
+              i=$((i + 1))
+            done
+            echo "scale=1; ($composite - 1) * 100" | bc -l 2>/dev/null || echo "?"
+          }
+
           allocators=()
           for f in bench-*-best.txt; do
             [ -f "$f" ] || continue
@@ -526,11 +580,7 @@ jobs:
             t4=$(parse_best "bench-${name}-best.txt" "throughput_4t")
             rss=$(parse_best "bench-${name}-best.txt" "rss_kb")
 
-            if [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
-              lat_ratio=$(echo "scale=2; $lat / $g_lat" | bc 2>/dev/null || echo "?")
-            else
-              lat_ratio="?"
-            fi
+            # Compute throughput ratios vs glibc
             if [ -n "$g_t1" ] && [ "$g_t1" != "0" ] && [ "$g_t1" != "0.0" ]; then
               t1_ratio=$(echo "scale=2; $t1 / $g_t1" | bc 2>/dev/null || echo "?")
             else
@@ -542,7 +592,20 @@ jobs:
               t4_ratio="?"
             fi
 
-            table_rows="${table_rows}| **${name}** | ${lat} ns | ${lat_ratio}x | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
+            composite=$(compute_composite "bench-${name}-best.txt" "bench-glibc-best.txt")
+            if [ "$composite" != "?" ]; then
+              if [ "$(echo "$composite > 0" | bc 2>/dev/null)" = "1" ]; then
+                composite_display="+${composite}%"
+              elif [ "$(echo "$composite == 0" | bc 2>/dev/null)" = "1" ]; then
+                composite_display="0%"
+              else
+                composite_display="${composite}%"
+              fi
+            else
+              composite_display="—"
+            fi
+
+            table_rows="${table_rows}| **${name}** | ${composite_display} | ${lat} ns | ${t1} Mops/s | ${t1_ratio}x | ${t4} Mops/s | ${t4_ratio}x | ${rss} KB |
           "
           done
 
@@ -554,8 +617,8 @@ jobs:
 
           ### Multi-Allocator Comparison (ARM64)
 
-          | Allocator | Latency (64B) | Ratio | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
-          |-----------|------------:|------:|--------------:|------:|--------------:|------:|---------:|
+          | Allocator | Weighted Overhead | Latency (64B) | Throughput 1T | Ratio | Throughput 4T | Ratio | Peak RSS |
+          |-----------|------------------:|------------:|--------------:|------:|--------------:|------:|---------:|
           ${table_rows}
 
           > **Ratio interpretation:** Latency ratio < 1.0 = faster than glibc. Throughput ratio > 1.0 = faster than glibc.
