@@ -996,13 +996,17 @@ impl HardenedAllocator {
                                 // Compute new user pointer and copy data within slot
                                 let arena_idx = info.arena_index as usize;
                                 if arena_idx < self.num_arenas {
+                                    // Preserve the original alignment so memalign-
+                                    // allocated pointers keep their alignment contract.
+                                    let align = 1usize
+                                        << slab.get_slot_meta(slot_idx).align_shift.get().min(30);
                                     let new_user_ptr = self.arenas[arena_idx]
                                         .setup_cached_alloc_metadata(
                                             info.slab_ptr,
                                             slot_idx as u16,
                                             new_size,
                                             old_class,
-                                            MIN_ALIGN,
+                                            align,
                                             true,
                                         );
                                     if new_user_ptr != ptr {
