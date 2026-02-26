@@ -22,7 +22,11 @@ pub struct SlotMeta {
     pub checksum: Cell<u64>,
     pub requested_size: Cell<u32>,
     pub flags: core::sync::atomic::AtomicU8,
-    _pad: [u8; 3],
+    /// log2(alignment) used for the front-gap calculation.
+    /// Stored so check_integrity() can reproduce the correct gap
+    /// for memalign/posix_memalign allocations.
+    pub align_shift: Cell<u8>,
+    _pad: [u8; 2],
 }
 
 const SLOT_META_FLAG_FREED: u8 = 0x01;
@@ -34,7 +38,8 @@ impl SlotMeta {
             requested_size: Cell::new(0),
             checksum: Cell::new(0),
             flags: core::sync::atomic::AtomicU8::new(0),
-            _pad: [0; 3],
+            align_shift: Cell::new(0),
+            _pad: [0; 2],
         }
     }
 
@@ -82,6 +87,7 @@ impl SlotMeta {
         self.checksum.set(0);
         self.requested_size.set(0);
         self.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.align_shift.set(0);
     }
 
     /// Write helpers using Cell — sound interior mutability without UnsafeCell
@@ -465,6 +471,8 @@ impl Arena {
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+        meta.align_shift
+            .set(crate::util::MIN_ALIGN.trailing_zeros() as u8);
 
         let slot_base = slab.slot_base(slot);
 
@@ -640,6 +648,7 @@ impl Arena {
 
             meta.requested_size_store(size as u32);
             meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+            meta.align_shift.set(align.trailing_zeros() as u8);
             let checksum = crate::hardening::integrity::compute_checksum(
                 slot_base_ptr as usize,
                 size as u32,
@@ -670,6 +679,7 @@ impl Arena {
 
         meta.requested_size_store(size as u32);
         meta.flags.store(0, core::sync::atomic::Ordering::Relaxed);
+        meta.align_shift.set(align.trailing_zeros() as u8);
 
         let checksum =
             crate::hardening::integrity::compute_checksum(slot_base_ptr as usize, size as u32, 0);
@@ -1001,6 +1011,16 @@ impl Arena {
                         continue;
                     }
 
+                    // Skip pre-allocated thread-cache slots whose metadata
+                    // hasn't been initialized. alloc_batch_raw() marks slots
+                    // as allocated in the bitmap but defers metadata setup to
+                    // setup_cached_alloc_metadata() when actually used.
+                    // requested_size is always >= 1 for real allocations
+                    // (malloc(0) becomes malloc(1)), so 0 means uninitialized.
+                    if meta.requested_size.get() == 0 {
+                        continue;
+                    }
+
                     result.total_slots_checked += 1;
 
                     if meta.is_freed() {
@@ -1033,10 +1053,15 @@ impl Arena {
                     {
                         let requested_size = meta.requested_size.get() as usize;
                         let aligned_size = align_up(requested_size, crate::util::MIN_ALIGN);
+                        // Use the stored alignment (not MIN_ALIGN) to match
+                        // the gap computed during allocation. memalign/
+                        // posix_memalign use a larger alignment which produces
+                        // a different (smaller) front gap.
+                        let align = 1usize << meta.align_shift.get().min(30);
                         let gap = if aligned_size >= slot_sz {
                             0
                         } else {
-                            crate::util::align_down(slot_sz - aligned_size, crate::util::MIN_ALIGN)
+                            crate::util::align_down(slot_sz - aligned_size, align)
                         };
                         // Check front-gap canary
                         if gap > 0
