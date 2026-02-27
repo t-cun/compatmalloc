@@ -3,7 +3,6 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 pub use linux as sys;
 
-#[cfg(feature = "mte")]
 pub mod mte;
 
 #[cfg(target_os = "macos")]

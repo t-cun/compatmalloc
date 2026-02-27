@@ -70,9 +70,12 @@ pub unsafe fn compatmalloc_init() {
     crate::hardening::canary::init_canary_secret();
 
     // Try to enable ARM64 MTE if available
-    #[cfg(feature = "mte")]
+    #[cfg(target_arch = "aarch64")]
     {
-        crate::platform::mte::init();
+        // Safety: called from single-threaded init context
+        unsafe {
+            crate::platform::mte::init();
+        }
     }
 
     // Initialize the hardened allocator
