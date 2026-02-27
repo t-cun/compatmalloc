@@ -405,7 +405,7 @@ jobs:
         run: cargo build --release
         env:
           CC: clang
-          RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=lld"
+          RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=lld -C linker-plugin-lto -C target-feature=+lse"
 
       - name: Verify library exists
         run: test -f target/release/libcompatmalloc.so
