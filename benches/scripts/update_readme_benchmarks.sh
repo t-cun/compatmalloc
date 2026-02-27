@@ -28,6 +28,27 @@ fmt_ratio() {
     printf "%.2f" "$1"
 }
 
+compute_composite() {
+  local alloc_file="$1" baseline_file="$2"
+  local sizes="16 32 64 128 256 512 1024 4096 16384 65536 262144"
+  local weights="0.20 0.15 0.15 0.12 0.10 0.08 0.05 0.05 0.04 0.03 0.03"
+  local composite=0
+  local i=1
+  for size in $sizes; do
+    local w=$(echo "$weights" | cut -d' ' -f$i)
+    local a_lat=$(parse_field "$alloc_file" "latency_${size}")
+    local g_lat=$(parse_field "$baseline_file" "latency_${size}")
+    if [ -n "$a_lat" ] && [ -n "$g_lat" ] && [ "$g_lat" != "0" ]; then
+      local ratio=$(echo "$a_lat / $g_lat" | bc -l)
+      composite=$(echo "$composite + $w * $ratio" | bc -l)
+    else
+      composite=$(echo "$composite + $w" | bc -l)
+    fi
+    i=$((i + 1))
+  done
+  printf "%.1f" "$(echo "($composite - 1) * 100" | bc -l)"
+}
+
 # --- Build x86_64 comparison table rows ---
 
 glibc_best="$BENCH_DIR/bench-glibc-best.txt"
@@ -49,9 +70,17 @@ for name in compatmalloc glibc jemalloc mimalloc scudo; do
     t1=$(parse_field "$best" "throughput_1t")
     t4=$(parse_field "$best" "throughput_4t")
 
-    lat_r=$(fmt_ratio "$(echo "$lat / $g_lat" | bc -l)")
     t1_r=$(fmt_ratio "$(echo "$t1 / $g_t1" | bc -l)")
     t4_r=$(fmt_ratio "$(echo "$t4 / $g_t4" | bc -l)")
+
+    composite=$(compute_composite "$best" "$glibc_best")
+    if [ "$(echo "$composite > 0" | bc)" = "1" ]; then
+      comp_display="+${composite}%"
+    elif [ "$composite" = "0.0" ] || [ "$composite" = "0" ]; then
+      comp_display="**0%**"
+    else
+      comp_display="**${composite}%**"
+    fi
 
     if [ "$name" = "compatmalloc" ]; then
         dn="**compatmalloc**"
@@ -59,7 +88,7 @@ for name in compatmalloc glibc jemalloc mimalloc scudo; do
         dn="$name"
     fi
 
-    x86_rows="${x86_rows}| ${dn} | ${lat} ns | ${lat_r}x | ${t1} Mops/s | ${t1_r}x | ${t4} Mops/s | ${t4_r}x |\n"
+    x86_rows="${x86_rows}| ${dn} | ${comp_display} | ${lat} ns | ${t1} Mops/s | ${t1_r}x | ${t4} Mops/s | ${t4_r}x |\n"
 done
 
 # --- Build app overhead table rows ---
@@ -102,7 +131,7 @@ awk -v x86_data="$x86_rows" -v app_data="$app_rows" '
 BEGIN { state = "normal" }
 
 # x86_64 table: match header row
-state == "normal" && /^\| Allocator \| Latency \(64B\) \| vs glibc/ {
+state == "normal" && /^\| Allocator \| Weighted Overhead/ {
     print
     state = "x86_sep"
     next

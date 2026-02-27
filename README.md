@@ -54,8 +54,8 @@ compatmalloc delivers **hardened-allocator security at near-glibc throughput** -
 
 ### x86_64 (CI Results)
 
-| Allocator | Latency (64B) | vs glibc | Throughput (1T) | vs glibc | Throughput (4T) | vs glibc |
-|-----------|------------:|--------:|--------------:|--------:|--------------:|--------:|
+| Allocator | Weighted Overhead | Latency (64B) | Throughput (1T) | vs glibc | Throughput (4T) | vs glibc |
+|-----------|------------------:|------------:|--------------:|--------:|--------------:|--------:|
 | **compatmalloc** | 13.8 ns | 1.20x | 67.66 Mops/s | 0.84x | 153.38 Mops/s | 0.91x |
 | glibc | 11.5 ns | 1.00x | 80.39 Mops/s | 1.00x | 168.15 Mops/s | 1.00x |
 | jemalloc | 8.8 ns | 0.77x | 102.07 Mops/s | 1.27x | 248.91 Mops/s | 1.48x |
