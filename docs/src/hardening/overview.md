@@ -70,3 +70,4 @@ Each layer provides value independently, but their combination makes exploitatio
 - [Heap Metadata Protection](./heap-metadata.md) -- Out-of-band metadata table.
 - [Stale Pointer Mitigation](./stale-pointers.md) -- Delayed reuse through quarantine.
 - [Guard Pages](./guard-pages.md) -- Hardware-enforced memory boundaries.
+- [ARM Memory Tagging (MTE)](./mte.md) -- Hardware memory tagging on ARM64 (replaces canaries, poison, and zero-on-free).

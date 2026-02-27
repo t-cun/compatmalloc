@@ -23,6 +23,7 @@
 - [Heap Metadata Protection](./hardening/heap-metadata.md)
 - [Stale Pointer Mitigation](./hardening/stale-pointers.md)
 - [Guard Pages](./hardening/guard-pages.md)
+- [ARM Memory Tagging (MTE)](./hardening/mte.md)
 
 # Performance
 
