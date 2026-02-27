@@ -842,46 +842,53 @@ impl Arena {
             crate::hardening::abort_with_message("compatmalloc: metadata integrity check failed\n");
         }
 
-        #[cfg(feature = "canaries")]
-        {
-            let requested_size = meta.requested_size.get() as usize;
-            let front_gap = ptr as usize - slot_base as usize;
-            if front_gap > 0
-                && !crate::hardening::canary::check_canary_front(
-                    slot_base,
-                    front_gap,
-                    meta.checksum.get(),
-                )
+        if crate::platform::mte::is_available() {
+            // MTE: re-tag the slot with a new random tag.
+            // Any dangling pointers with the old tag will fault on access.
+            // This replaces: canary check, poison fill, zero-on-free.
+            crate::platform::mte::tag_freed(slot_base, slot_sz);
+        } else {
+            #[cfg(feature = "canaries")]
             {
-                crate::hardening::abort_with_message(
-                    "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
-                );
+                let requested_size = meta.requested_size.get() as usize;
+                let front_gap = ptr as usize - slot_base as usize;
+                if front_gap > 0
+                    && !crate::hardening::canary::check_canary_front(
+                        slot_base,
+                        front_gap,
+                        meta.checksum.get(),
+                    )
+                {
+                    crate::hardening::abort_with_message(
+                        "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
+                    );
+                }
+                let effective_slot_sz = slot_sz - front_gap;
+                if requested_size < effective_slot_sz
+                    && !crate::hardening::canary::check_canary(
+                        ptr,
+                        requested_size,
+                        effective_slot_sz,
+                        meta.checksum.get(),
+                    )
+                {
+                    crate::hardening::abort_with_message(
+                        "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
+                    );
+                }
             }
-            let effective_slot_sz = slot_sz - front_gap;
-            if requested_size < effective_slot_sz
-                && !crate::hardening::canary::check_canary(
-                    ptr,
-                    requested_size,
-                    effective_slot_sz,
-                    meta.checksum.get(),
-                )
+
+            // Zero (information leak defense) or poison (UAF detection).
+            // Use slot_base for full slot coverage.
+            #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
             {
-                crate::hardening::abort_with_message(
-                    "compatmalloc: heap buffer overflow detected (canary corrupted)\n",
-                );
+                ptr::write_bytes(slot_base, 0, slot_sz);
             }
-        }
 
-        // Zero (information leak defense) or poison (UAF detection).
-        // Use slot_base for full slot coverage.
-        #[cfg(all(feature = "zero-on-free", not(feature = "poison-on-free")))]
-        {
-            ptr::write_bytes(slot_base, 0, slot_sz);
-        }
-
-        #[cfg(feature = "poison-on-free")]
-        {
-            crate::hardening::poison::poison_region(slot_base, slot_sz);
+            #[cfg(feature = "poison-on-free")]
+            {
+                crate::hardening::poison::poison_region(slot_base, slot_sz);
+            }
         }
 
         if !slab.ever_freed.load(Ordering::Relaxed) {
