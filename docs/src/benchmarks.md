@@ -109,6 +109,28 @@ If the overhead is too high for your use case, you can selectively disable featu
 | Disable `canaries` | Removes canary write/check per alloc/free |
 | `COMPATMALLOC_DISABLE=1` | Bypasses all hardening (passthrough to glibc) |
 
+## Weighted composite overhead
+
+The headline "Weighted Overhead" metric computes a single overhead percentage that accounts for real-world allocation size distributions. Instead of reporting only the 64-byte latency, we weight each allocation size by its frequency in typical programs (based on jemalloc/tcmalloc telemetry data):
+
+| Size | Weight | Rationale |
+|------|--------|-----------|
+| 16B  | 20%    | Most common (tiny objects, pointers, small structs) |
+| 32B  | 15%    | Second most common |
+| 64B  | 15%    | Common for small structs, string headers |
+| 128B | 12%    | Medium-small objects |
+| 256B | 10%    | Strings, small buffers |
+| 512B | 8%     | Buffers |
+| 1K   | 5%     | Page-ish allocations |
+| 4K   | 5%     | Page-aligned allocations |
+| 16K  | 4%     | Large buffers |
+| 64K  | 3%     | Near mmap threshold |
+| 256K | 3%     | Very large allocations |
+
+**Formula:** `overhead = (Σ weight_i × (alloc_latency_i / glibc_latency_i) − 1) × 100%`
+
+A weighted overhead of +15% means compatmalloc is 15% slower than glibc across a representative workload mix. Negative values indicate compatmalloc is faster.
+
 ## Methodology notes
 
 When benchmarking allocators, keep the following in mind:
