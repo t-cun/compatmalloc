@@ -149,7 +149,11 @@ impl Slab {
         #[cfg(not(feature = "guard-pages"))]
         let total_size = header_and_bitmap_and_meta + data_pages;
 
-        let base = platform::map_anonymous(total_size);
+        let base = if platform::mte::is_available() {
+            platform::mte::map_anonymous_mte(total_size)
+        } else {
+            platform::map_anonymous(total_size)
+        };
         if base.is_null() {
             return ptr::null_mut();
         }
