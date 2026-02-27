@@ -483,6 +483,18 @@ impl Arena {
             crate::hardening::integrity::compute_checksum(slot_base as usize, size as u32, 0);
         meta.checksum_store(checksum);
 
+        if crate::platform::mte::is_available() {
+            // MTE: tag the entire slot with a random hardware tag.
+            // Overflow/underflow detected immediately on access via tag mismatch.
+            let slot_sz = size_class::slot_size(slab.class_index);
+            let tagged_base = crate::platform::mte::tag_alloc(slot_base);
+            crate::platform::mte::tag_region(tagged_base, slot_sz);
+            // Apply the same tag to user_ptr
+            let tag_bits = tagged_base as usize & (0xFu64 << 56) as usize;
+            let user_tagged = ((user_ptr as usize) & !((0xFu64 << 56) as usize)) | tag_bits;
+            return Some(user_tagged as *mut u8);
+        }
+
         // Use checksum value as canary for gap fill
         #[cfg(feature = "canaries")]
         {
@@ -657,6 +669,15 @@ impl Arena {
                 0,
             );
             meta.checksum_store(checksum);
+
+            if crate::platform::mte::is_available() {
+                let tagged_base = crate::platform::mte::tag_alloc(slot_base_ptr);
+                crate::platform::mte::tag_region(tagged_base, slot_sz);
+                let tag_bits = tagged_base as usize & (0xFu64 << 56) as usize;
+                let result = ((slot_base_ptr as usize) & !((0xFu64 << 56) as usize)) | tag_bits;
+                return result as *mut u8;
+            }
+
             // Still need back-gap canary when requested_size < slot_size
             // (e.g., malloc(49) with slot_size=64: gap=0 but 15 bytes of back canary).
             // Skipped for realloc: canary must be written AFTER the caller copies data,
@@ -686,6 +707,14 @@ impl Arena {
         let checksum =
             crate::hardening::integrity::compute_checksum(slot_base_ptr as usize, size as u32, 0);
         meta.checksum_store(checksum);
+
+        if crate::platform::mte::is_available() {
+            let tagged_base = crate::platform::mte::tag_alloc(slot_base_ptr);
+            crate::platform::mte::tag_region(tagged_base, slot_sz);
+            let tag_bits = tagged_base as usize & (0xFu64 << 56) as usize;
+            let result = ((user_ptr as usize) & !((0xFu64 << 56) as usize)) | tag_bits;
+            return result as *mut u8;
+        }
 
         // Write canary bytes in the gap regions.
         // Skipped for realloc: canary must be written AFTER the caller copies data.
