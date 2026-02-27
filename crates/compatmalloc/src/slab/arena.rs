@@ -964,8 +964,11 @@ impl Arena {
     unsafe fn recycle_evicted_inline(entry: &crate::hardening::quarantine::QuarantineEntry) {
         let ptr = entry.ptr;
 
+        // Skip poison check when MTE is active: poison bytes were not written
+        // (MTE re-tagging replaces poison fill), so check_poison would always fail.
+        // MTE's hardware tag mismatch provides equivalent UAF detection.
         #[cfg(feature = "write-after-free-check")]
-        {
+        if !crate::platform::mte::is_available() {
             let slot_sz = size_class::slot_size(entry.class_index);
             if !crate::hardening::poison::check_poison(ptr, slot_sz) {
                 crate::hardening::abort_with_message("compatmalloc: write-after-free detected\n");
@@ -1090,9 +1093,10 @@ impl Arena {
                         continue;
                     }
 
-                    // Verify canary bytes if enabled
+                    // Verify canary bytes if enabled (skip when MTE is active:
+                    // no canary bytes were written, hardware tags handle detection)
                     #[cfg(feature = "canaries")]
-                    {
+                    if !crate::platform::mte::is_available() {
                         let requested_size = meta.requested_size.get() as usize;
                         let aligned_size = align_up(requested_size, crate::util::MIN_ALIGN);
                         // Use the stored alignment (not MIN_ALIGN) to match

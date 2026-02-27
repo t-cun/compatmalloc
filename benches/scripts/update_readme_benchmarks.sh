@@ -38,7 +38,7 @@ compute_composite() {
     local w=$(echo "$weights" | cut -d' ' -f$i)
     local a_lat=$(parse_field "$alloc_file" "latency_${size}")
     local g_lat=$(parse_field "$baseline_file" "latency_${size}")
-    if [ -n "$a_lat" ] && [ -n "$g_lat" ] && [ "$g_lat" != "0" ]; then
+    if [ -n "$a_lat" ] && [ -n "$g_lat" ] && [ "$g_lat" != "0" ] && [ "$g_lat" != "0.0" ]; then
       local ratio=$(echo "$a_lat / $g_lat" | bc -l)
       composite=$(echo "$composite + $w * $ratio" | bc -l)
     else

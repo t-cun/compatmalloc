@@ -316,7 +316,9 @@ impl HardenedAllocator {
                         // Same-size recycling: if metadata from the previous alloc matches,
                         // skip all metadata writes + checksum. Just clear the freed bit.
                         // Saves ~8-10 cycles in tight malloc/free loops.
-                        if align == MIN_ALIGN {
+                        // Disabled when MTE is active: the slot was re-tagged on free,
+                        // so cached.ptr carries a stale tag that would fault on access.
+                        if align == MIN_ALIGN && !crate::platform::mte::is_available() {
                             let slab = &*(cached.slab_ptr as *mut crate::slab::arena::Slab);
                             let meta = slab.get_slot_meta_ref(cached.slot_index as usize);
                             if meta.requested_size.get() == size as u32 {
@@ -975,8 +977,10 @@ impl HardenedAllocator {
                                         );
                                     }
 
+                                    // Skip canary check when MTE is active: no canary bytes
+                                    // were written, so checking would read untagged data.
                                     #[cfg(feature = "canaries")]
-                                    {
+                                    if !crate::platform::mte::is_available() {
                                         let slot_sz = crate::slab::size_class::slot_size(old_class);
                                         let front_gap = ptr as usize - slot_base as usize;
                                         if front_gap > 0
@@ -1028,23 +1032,24 @@ impl HardenedAllocator {
                                         // memmove-safe since src/dst may overlap
                                         core::ptr::copy(ptr, new_user_ptr, copy_size);
                                     }
-                                    // Clear stale canary bytes in newly exposed region (growing).
-                                    // Must happen AFTER copy to avoid destroying user data.
+                                    // Skip canary operations when MTE is active: MTE
+                                    // handles overflow detection via hardware tags.
                                     #[cfg(feature = "canaries")]
-                                    if new_size > old_size {
-                                        core::ptr::write_bytes(
-                                            new_user_ptr.add(old_size),
-                                            0,
-                                            new_size - old_size,
-                                        );
-                                    }
+                                    if !crate::platform::mte::is_available() {
+                                        // Clear stale canary bytes in newly exposed region (growing).
+                                        // Must happen AFTER copy to avoid destroying user data.
+                                        if new_size > old_size {
+                                            core::ptr::write_bytes(
+                                                new_user_ptr.add(old_size),
+                                                0,
+                                                new_size - old_size,
+                                            );
+                                        }
 
-                                    // Write canaries AFTER the copy (and growing clear).
-                                    // setup_cached_alloc_metadata defers canary writes for
-                                    // realloc because the copy may read from the canary region
-                                    // when the user pointer shifts within the slot.
-                                    #[cfg(feature = "canaries")]
-                                    {
+                                        // Write canaries AFTER the copy (and growing clear).
+                                        // setup_cached_alloc_metadata defers canary writes for
+                                        // realloc because the copy may read from the canary region
+                                        // when the user pointer shifts within the slot.
                                         let slot_sz = crate::slab::size_class::slot_size(old_class);
                                         let front_gap = new_user_ptr as usize - slot_base as usize;
                                         let checksum =
@@ -1174,7 +1179,7 @@ impl HardenedAllocator {
                 }
             } else {
                 #[cfg(feature = "canaries")]
-                {
+                if !crate::platform::mte::is_available() {
                     // With canaries, the usable region is only the requested_size
                     // because the gap contains canary bytes.
                     if let Some((req_size, _slot)) =
