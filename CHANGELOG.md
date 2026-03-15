@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-03-15
+
+### Added
+
+- **ARM64 MTE (Memory Tagging Extension) support** — hardware-enforced memory safety on ARMv8.5-A+ hardware, replacing software canaries at zero overhead:
+  - MTE tagging wired into malloc and free hot paths
+  - `PROT_MTE` flag used for slab backing memory when MTE is available
+  - MTE re-tagging on free invalidates dangling pointers
+  - Always compiled on aarch64 with runtime detection (no feature flag needed)
+- **Thread-local large allocation cache** — eliminates syscalls and global lock contention from the large allocation hot path
+- **Weighted composite overhead score** in CI benchmark reports using real-world allocation size distribution
+
+### Fixed
+
+- Abort on `free()` of invalid pointers instead of silently ignoring them
+- Preserve alignment in `realloc` for `memalign`-allocated pointers
+- Pass caller alignment through `arena.alloc` for `memalign`
+- `check_integrity` false positives and `memalign` canary mismatch
+- Prevent segfault when glibc frees thread-local state after thread exit
+- Guard all canary/poison paths for MTE correctness
+- Fail CI when applications crash under `LD_PRELOAD`
+- ARM64 benchmark CI: install matching LLVM 21 toolchain for LTO builds
+
+### Performance
+
+- Eliminate syscalls and global locks from large allocation TLS cache hot path
+- Enable LTO and LSE atomics for ARM64 CI builds
+
 ## [0.1.0] - 2026-02-21
 
 Initial release.
