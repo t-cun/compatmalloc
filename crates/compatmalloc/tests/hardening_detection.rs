@@ -202,7 +202,7 @@ fn canary_corruption_detected() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[cfg(feature = "poison-on-free")]
+#[cfg(all(feature = "poison-on-free", feature = "quarantine"))]
 fn freed_memory_is_poisoned() {
     // The poison byte is 0xFE (defined in util.rs).
     const POISON: u8 = 0xFE;
@@ -257,7 +257,11 @@ fn freed_memory_is_poisoned() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[cfg(all(feature = "poison-on-free", not(feature = "zero-on-free")))]
+#[cfg(all(
+    feature = "poison-on-free",
+    feature = "quarantine",
+    not(feature = "zero-on-free")
+))]
 fn freed_memory_poison_full_slot() {
     const POISON: u8 = 0xFE;
 
