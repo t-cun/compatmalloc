@@ -411,7 +411,7 @@ jobs:
         run: cargo build --release
         env:
           CC: clang-21
-          RUSTFLAGS: "-Clinker=clang-21 -Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto -Ctarget-feature=+lse"
+          RUSTFLAGS: "-Clinker=clang-21 -Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto -Ctarget-feature=+lse,+mte"
 
       - name: Verify library exists
         run: test -f target/release/libcompatmalloc.so
