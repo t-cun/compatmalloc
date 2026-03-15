@@ -392,11 +392,17 @@ jobs:
         with:
           key: ${{ hashFiles('crates/**') }}
 
-      - name: Install system clang, lld, and allocator libraries
+      - name: Install clang-21 and lld-21
         run: |
+          CODENAME=$(lsb_release -cs)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-21 lld-21
+
+      - name: Install allocator libraries and benchmark deps
+        run: |
           sudo apt-get install -y -qq \
-            clang lld \
             libjemalloc2 libjemalloc-dev \
             libmimalloc2.0 libmimalloc-dev \
             bc
@@ -404,8 +410,8 @@ jobs:
       - name: Build release library
         run: cargo build --release
         env:
-          CC: clang
-          RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=lld -C linker-plugin-lto -C target-feature=+lse"
+          CC: clang-21
+          RUSTFLAGS: "-Clinker=clang-21 -Clink-arg=-fuse-ld=lld-21 -Clinker-plugin-lto -Ctarget-feature=+lse"
 
       - name: Verify library exists
         run: test -f target/release/libcompatmalloc.so
